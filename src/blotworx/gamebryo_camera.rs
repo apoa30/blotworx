@@ -102,6 +102,7 @@ impl State {
             }
         }Ok(())
     }
+    pub fn prepared(&self,owner:usize)->bool {self.cameras.contains_key(&owner)}
     pub fn request(&mut self,owner:usize,name:&str)->Result<()> {
         let camera=self.cameras.get_mut(&owner).context("Gamebryo actor has no prepared source animation owner")?;
         let id=camera.resources.find_name(name);

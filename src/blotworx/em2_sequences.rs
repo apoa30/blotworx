@@ -75,7 +75,7 @@ impl Catalog {
         let Some(dictionary)=self.dictionary.as_ref() else{return Ok(false)};
         let request=self.pending.as_mut().context("No admitted sequence to present")?;
         let sequence=&self.resources[request.resource].sequence;
-        if let Some((event,line))=advance_request(sequence,dictionary,request,&mut schedule)? {
+        if let Some((event,line))=advance_request(sequence,dictionary,request,globals,&mut schedule)? {
             let blocking=sequence.flags&2!=0;
             let incoming=ActiveDialog{request:self.pending.take().unwrap(),event,line,selection:0,blocking};
             // Only this functional panel is owned here: no native camera or
@@ -91,7 +91,7 @@ impl Catalog {
         ensure!(answer==0,"Choices require their Apprentice44 choice receiver");
         let sequence=&self.resources[active.request.resource].sequence;
         let dictionary=self.dictionary.as_ref().context("Active dialogue dictionary unavailable")?;
-        if let Some((event,line))=advance_request(sequence,dictionary,&mut active.request,&mut schedule)? {
+        if let Some((event,line))=advance_request(sequence,dictionary,&mut active.request,globals,&mut schedule)? {
             active.event=event;active.line=line;active.selection=0;
         }else{
             finish_request(sequence,globals)?;self.active=None;self.playtest_completed+=1;
@@ -122,12 +122,38 @@ fn active_admits(current_owner:usize,current_name:&str,current_flags:u16,incomin
 /// ScriptSystemThread::ExecuteStringOnThread. It does not wait for completion.
 /// Advance only after successful admission, so a later unsupported event cannot
 /// cause an earlier Lua event to be scheduled twice when retried.
-fn advance_request(sequence:&super::sequence44::Sequence,dictionary:&super::em2_dialogue::Dictionary,request:&mut Start,schedule:&mut impl FnMut(&str,usize)->Result<()>)->Result<Option<(usize,super::em2_dialogue::Line)>> {
+fn advance_request(sequence:&super::sequence44::Sequence,dictionary:&super::em2_dialogue::Dictionary,request:&mut Start,globals:&mut super::em2_global_state::State,schedule:&mut impl FnMut(&str,usize)->Result<()>)->Result<Option<(usize,super::em2_dialogue::Line)>> {
     while let Some(event)=sequence.events.get(request.cursor) {
         match event.tag {
             0=>{let line=dictionary.line(&event.fields)?;let index=request.cursor;request.cursor+=1;return Ok(Some((index,line)));}
             7=>{if let Some(source)=event.fields["lua"].as_str().filter(|s|!s.is_empty()){schedule(source,request.owner)?;}request.cursor+=1;}
-            tag=>anyhow::bail!("Apprentice44 playtest event {tag} requires its gameplay receiver; event {} retained",request.cursor),
+            // multi-line dialog: show the first line (selection mode not reproduced)
+            1=>{
+                let index=request.cursor;request.cursor+=1;
+                if let Some(first)=event.fields["dialogs"].as_array().and_then(|d|d.first()) {
+                    return Ok(Some((index,dictionary.line(&serde_json::json!({"dialog":first}))?)));
+                }
+            }
+            // global changes (flag treated as "add to current value"; inferred, not reverse engineered)
+            9=>{
+                if let Some(changes)=event.fields["changes"].as_array() {for change in changes {
+                    let (Some(name),Some(value))=(change["name"].as_str(),change["value"].as_i64()) else {continue};
+                    let value=if event.fields["flag"].as_bool()==Some(true) {i64::from(globals.get(name).unwrap_or(0))+value}else{value};
+                    if globals.set(name,value.clamp(i16::MIN as i64,i16::MAX as i64) as i32).is_none() {log::warn!("Sequence global {name} is not registered");}
+                }}
+                request.cursor+=1;
+            }
+            // timed waits play instantly in the playtest
+            10=>{request.cursor+=1;}
+            tag=>{
+                // Other event receivers (animations, inventory, cameras...) aren't built yet: skip the
+                // event instead of stopping the level's scripts, and say so once per kind.
+                static SEEN:std::sync::Mutex<Option<std::collections::HashSet<u16>>>=std::sync::Mutex::new(None);
+                if SEEN.lock().map(|mut s|s.get_or_insert_with(Default::default).insert(tag)).unwrap_or(false) {
+                    log::warn!("EM2 world service not implemented (ignored): SequenceEvent{tag}");
+                }
+                request.cursor+=1;
+            }
         }
     }Ok(None)
 }

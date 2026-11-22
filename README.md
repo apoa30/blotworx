@@ -16,9 +16,40 @@ cargo run --locked
 
 Import a Wii disc image or choose an existing extracted game folder. Open **F10 → Game** to change levels and **F10 → Tools** to unlock preview abilities for the session. In the EM2 PC preview, **F6** toggles the shared controller.
 
-The EM2 startup camera and several material inputs are still incomplete. For automated captures and validation, use `cargo run --locked -- diagnose --help`.
+For automated captures and validation, use `cargo run --locked -- diagnose --help`.
 
 For interactive debugging, use the standard `dev` build shown above. It keeps debug assertions and optimizes the engine and its dependencies across all levels. Avoid reusing executables built with an `opt-level=0` override for playtesting. Press F3 in EM1 to view runtime frame timings.
+
+## Epic Mickey 2 (PC)
+
+Point `--data` at an EM2 PC installation (the folder with `DEM2.exe` and `packfiles`). `--level` takes a level descriptor name, optionally with a state; without one, Blotworx starts in Yen Sid's Lab.
+
+```powershell
+cargo run --locked -- --data "C:\Games\Epic Mickey 2" --level MeanStreet_South.visit2 --shared-playtest
+```
+
+`--shared-playtest` starts with movement and the follow camera on (F6 toggles it). Every warning and script error is printed to the console as well as written to the log. Script services that aren't implemented yet are logged once as `EM2 world service not implemented (ignored): <name>` and skipped, so the level's scripts keep running.
+
+The world, characters and sky draw with the game's own shaders, so normal and specular maps, scrolling textures and the level's baked lighting (`.lit`) show. EM2 bloom and colour correction run as a post pass.
+
+Settings (environment variables):
+
+| Variable | Effect |
+| --- | --- |
+| `BLOTWORX_EM2_ENV_NATIVE=0` | World surfaces use the generic fallback renderer instead of the game's shaders |
+| `BLOTWORX_EM2_ENV_NATIVE_SKIP=a,b` | Keeps world shaders whose names contain any of these parts on the fallback |
+| `BLOTWORX_EM2_CHAR_NATIVE=0` | Characters use the fallback renderer |
+| `BLOTWORX_EM2_POST=0` | Turns off EM2 bloom and colour correction |
+| `BLOTWORX_STRICT_EM2=1` | Unimplemented script services stop the scripts again (for finding gaps) |
+| `BLOTWORX_VSYNC=0` | Removes the refresh-rate frame cap |
+
+To check a level's scripts, run a timed capture and read `scene_events.world.halted` and `source_errors` in the `.runtime.json` written next to the image:
+
+```powershell
+cargo run --locked -- diagnose --data "C:\Games\Epic Mickey 2" --level MeanStreet_South.visit1 --shared-playtest --capture shot.png --capture-tick 1800
+```
+
+Not done yet: the game's depth pre-pass, projected shadows and per-object point lights on world surfaces; animation of non-camera props from scripts; health, inventory and several sequence event kinds; logic timers. Mean Street South is the most tested level.
 
 ## Layout
 

@@ -3094,6 +3094,10 @@ pub struct Motion {
     pub damage_leap_gravity: f32,
     pub damage_leap_air_speed: f32,
     pub damage_leap_acceleration: f32,
+    /// EM2 MickeyPlayerMotionController skid / 180 settings (None = not authored).
+    pub em2_moves: Option<super::locomotion_actions::Settings>,
+    /// EM2 The180MinAllowedSpeed: extra factor on the "running fast" threshold (360 0x829f6bf0).
+    pub turn_min_allowed_speed: f32,
 }
 impl Default for Motion {
     fn default() -> Self {
@@ -3134,6 +3138,8 @@ impl Default for Motion {
             damage_leap_gravity: -22.,
             damage_leap_air_speed: 5.,
             damage_leap_acceleration: 20.,
+            em2_moves: None,
+            turn_min_allowed_speed: 1.,
         }
     }
 }

@@ -25,7 +25,20 @@ pub fn install() -> Option<PathBuf> {
     let mut logger = env_logger::Builder::from_env(
         env_logger::Env::default().default_filter_or("warn,blotworx=info,blotworx_phase=info"),
     );
-    logger.target(env_logger::Target::Pipe(Box::new(file)));
+    // Every log line goes to the log file and to the console window the game was started from.
+    struct Tee(fs::File);
+    impl std::io::Write for Tee {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            let _ = std::io::stderr().write_all(bytes);
+            self.0.write_all(bytes)?;
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            let _ = std::io::stderr().flush();
+            self.0.flush()
+        }
+    }
+    logger.target(env_logger::Target::Pipe(Box::new(Tee(file))));
     logger.try_init().ok()?;
     let previous = std::panic::take_hook();
     // Keep writing to the same session even if a second process rotates its name.

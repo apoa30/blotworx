@@ -188,6 +188,21 @@ impl Character {
         }
         self.ticks+=ticks;self.apply(draws)
     }
+    /// Wwise event names carried by this tick's delivered behavior events: EM2 attaches sounds to
+    /// animation clips as clip triggers with a string payload (e.g. Mickey_Jump.hkx fires
+    /// "Play_sfx_Mickey_Jump_Core"), so the game's own timing decides when they play.
+    pub fn sound_triggers(&self)->Vec<String> {
+        let Ok(playback)=self.active_playback() else {return Vec::new()};
+        playback.delivered_events.iter().filter_map(|e|e.payload.as_ref()).filter_map(|r|self.graph.objects.get(&r.id))
+            .filter(|o|o.klass=="hkbStringEventPayload").filter_map(|o|o.fields["data"].as_str().map(str::to_owned))
+            .filter(|s|!s.is_empty()).collect()
+    }
+    /// Names of this tick's delivered behavior events (diagnostics).
+    pub fn delivered_event_names(&self)->Vec<String> {
+        let Ok(playback)=self.active_playback() else {return Vec::new()};
+        let names=self.graph.single("hkbBehaviorGraphStringData").ok().and_then(|d|d["eventNames"].as_array().cloned()).unwrap_or_default();
+        playback.delivered_events.iter().map(|e|names.get(e.id.max(0) as usize).and_then(|v|v.as_str()).map(str::to_owned).unwrap_or_else(||format!("#{}",e.id))).collect()
+    }
     /// PC registrationa28d80 assigns native13 to VAR_Has_Tool. Settera25fb0
     /// writes its mapped word and legitimately ignores an absent local symbol.
     pub fn bone_pose(&self,name:&str)->Result<super::actor_bone_query::Pose> {

@@ -230,6 +230,72 @@ impl Lifecycle {
     }
 }
 
+/// EM2 playtest driver for skid / 180 turn, per the Xbox 360 MickeyPlayerMotionController
+/// (0x829fb718 per tick: update the running action, then try entry once on the ground long
+/// enough; 0x829f6bf0 fast history; 0x829f9348 skid and 0x829f9058 turn entry). Timers use the
+/// fixed simulation step. Animation events are queued in `events` for the behaviour graph.
+pub struct Em2Driver {
+    settings: Settings,
+    min_allowed: f32,
+    life: Lifecycle,
+    fast: bool,
+    fast_direction: [f32; 3],
+    since_fast: f32,
+    since_turn: f32,
+    ground_time: f32,
+    pub events: Vec<&'static str>,
+}
+impl Em2Driver {
+    pub fn new(settings: Settings, min_allowed: f32) -> Self {
+        Self { settings, min_allowed, life: Lifecycle::default(), fast: false, fast_direction: [0., 0., 1.],
+            since_fast: 0., since_turn: 0., ground_time: 0., events: Vec::new() }
+    }
+    pub fn action(&self) -> Action { self.life.action }
+    /// `desired` is this tick's world-space movement input (length <= 1).
+    pub fn tick(&mut self, player: &mut super::physics::Player, desired: [f32; 3], dt: f32) {
+        let grounded = player.grounded;
+        let state = if grounded { 0 } else { 1 };
+        self.since_fast += dt;
+        self.since_turn += dt;
+        self.ground_time = if grounded { self.ground_time + dt } else { 0. };
+        let horizontal = [player.velocity[0], 0., player.velocity[2]];
+        let speed = (horizontal[0] * horizontal[0] + horizontal[2] * horizontal[2]).sqrt();
+        let sample = grounded.then_some(speed);
+        let maximum = player.max_move_speed();
+        // EM2: threshold = 0.95 * Max Move Speed * The180MinAllowedSpeed
+        if refresh_fast_history(&mut self.fast, state, sample, maximum * self.min_allowed) && speed > 1e-6 {
+            self.since_fast = 0.;
+            self.fast_direction = [horizontal[0] / speed, 0., horizontal[2] / speed];
+        }
+        let mut effects = Vec::new();
+        if !grounded && self.life.action != Action::None {
+            self.life.reset(true, |e| effects.push(e));
+        }
+        self.life.update(state, speed, &self.settings, dt, |e| effects.push(e));
+        let input_length = (desired[0] * desired[0] + desired[2] * desired[2]).sqrt();
+        let direction_dot = if input_length > 1e-6 {
+            (self.fast_direction[0] * desired[0] + self.fast_direction[2] * desired[2]) / input_length
+        } else { 1. };
+        let input = EntryInput { latest_speed: sample, maximum_speed: maximum, input_length, direction_dot,
+            fast_history: self.fast, since_fast: self.since_fast, since_turn: self.since_turn,
+            ground_time: self.ground_time, enabled: true, blocked: false };
+        let before = self.life.action;
+        self.life.enter(&self.settings, &input, self.fast_direction, |e| effects.push(e));
+        if std::env::var_os("BLOTWORX_MOVES_LOG").is_some() && !effects.is_empty() {
+            eprintln!("[moves] {:?} -> {:?} speed {speed:.2} input {input_length:.2} dot {direction_dot:.2} fast {} since_fast {:.2} ground {:.2}: {:?}",
+                before, self.life.action, self.fast, self.since_fast, self.ground_time, effects);
+        }
+        for effect in effects {
+            match effect {
+                Effect::Animation(name) => self.events.push(name),
+                Effect::ResetTurnTimer => self.since_turn = 0.,
+                Effect::GameEvent(..) => {}
+                other => { let _ = player.apply_action_motion(other); }
+            }
+        }
+    }
+}
+
 /// REL 0x2229dc..0x222a18: motion+0x213 permits a negative speed
 /// when the current facing (in the support frame) opposes desired input.
 /// This branch is bypassed entirely when CharacterMaintainVelocity is set.

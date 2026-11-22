@@ -12,11 +12,15 @@ pub(super) fn pack(source:Option<[f32;9]>,transposed:bool)->[f32;16] {
     if transposed {transpose(&matrix)}else{matrix}
 }
 pub(super) fn resolve(material:&MaterialBindings,mapping:&str,index:Option<i32>,precision:Option<Precision>)->Result<Option<Value>> {
+    resolve_animated(material,mapping,index,precision,|_|None)
+}
+/// `animated` supplies a live (controller-driven) transform for a shader map slot, replacing the authored one.
+pub(super) fn resolve_animated(material:&MaterialBindings,mapping:&str,index:Option<i32>,precision:Option<Precision>,animated:impl Fn(u32)->Option<crate::nif_textures::UvTransform>)->Result<Option<Value>> {
     let names=["TexTransformShader","InvTexTransformShader","TexTransformShaderTranspose","InvTexTransformShaderTranspose"];
     let Some(kind)=names.iter().position(|name|mapping.eq_ignore_ascii_case(name)) else{return Ok(None)};
     if let Some(Err(error))=&material.legacy_texture_flags {anyhow::bail!("Texture transform property: {error}")}
     let index=index.context("Shader texture transform requires its authored NTMIndex")? as u32;
-    let transform=material.texture_transforms.get(&(true,index)).map(|value|value.as_ref().map_err(|error|anyhow::anyhow!("{error}"))).transpose()?.copied().flatten();
+    let transform=match animated(index) {Some(t)=>Some(t),None=>material.texture_transforms.get(&(true,index)).map(|value|value.as_ref().map_err(|error|anyhow::anyhow!("{error}"))).transpose()?.copied().flatten()};
     let matrix=if let Some(t)=transform {
         ensure!(kind!=1&&kind!=3,"Inverse shader texture transform needs its native singular-matrix adapter");
         Some(super::pc_float::texture_matrix([t.translation[0],t.translation[1],t.rotation,t.scale[0],t.scale[1],t.center[0],t.center[1]],t.method,precision.context("PC texture transform precision owner is absent")?)?)

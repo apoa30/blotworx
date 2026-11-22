@@ -821,6 +821,7 @@ pub struct GpuViewportCache {
     surfaces: super::surface_lighting::State,
     contact_pass:Option<Result<super::contact_occlusion::Pass,String>>,
     finish_pass: Option<Result<super::scene_finish::Pass,String>>,
+    em2_post: Option<Result<super::em2_post::Pass,String>>,
     scene_color: Option<(glow::Texture, [i32; 2])>,
     gpu_timing: super::gpu_timing::Pool,
     model_shadow_pass: Option<Result<super::model_shadow::Pass, String>>,
@@ -848,6 +849,9 @@ pub struct GpuViewportCache {
     pub u_shadow_map_loc: glow::UniformLocation,
 
     pub shadow_fbo: Option<glow::NativeFramebuffer>,
+    /// Frame counter and the light matrix the legacy shadow map was last drawn with.
+    pub shadow_age: u64,
+    pub shadow_vp: Option<[f32; 16]>,
     pub shadow_tex: Option<glow::NativeTexture>,
     pub shadow_program: glow::Program,
     pub u_shadow_light_vp: glow::UniformLocation,
@@ -2126,6 +2130,7 @@ impl GpuViewportCache {
             surfaces: Default::default(),
             contact_pass:None,
             finish_pass: None,
+            em2_post: None,
             scene_color: None,
             gpu_timing: Default::default(),
             model_shadow_pass: None,
@@ -2149,6 +2154,8 @@ impl GpuViewportCache {
             u_shadow_map_loc,
 
             shadow_fbo,
+            shadow_age: 0,
+            shadow_vp: None,
             shadow_tex,
             shadow_program,
             u_shadow_light_vp,
@@ -2562,6 +2569,18 @@ pub(crate) fn render_viewport(
         )
     };
     let vp_mat = mat4_mul(&proj_mat, &view_mat);
+    // Sky geometry sits beyond the camera's far plane (EM2: 90 units); it is drawn first in its own
+    // depth pass, so it gets the same projection with a far plane 100,000 units out.
+    let sky_proj_mat = {
+        let mut m = proj_mat;
+        if (m[10] - 1.0).abs() > 1e-6 && m[11] < 0.0 {
+            // m10 = (f+n)/(n-f), m14 = 2fn/(n-f)  =>  near = m14 / (m10 - 1)
+            let near = m[14] / (m[10] - 1.0);
+            let far = 100_000.0f32;
+            m[10] = (far + near) / (near - far); m[14] = 2.0 * far * near / (near - far);
+        }
+        m
+    };
 
     // Primary directional light vector for directional shadow map matrix
     let primary=if vp.surfaces.mode!=0 {super::spatial_lights::key_directional(&lights,eye).map(|i|lights[i].clone())}else{lights.iter().find(|l|l.light_type==1).cloned()};
@@ -2766,6 +2785,7 @@ pub(crate) fn render_viewport(
                         .zip(&early_rejected).enumerate()
                         .map(|(index,((cmd, prepared), early))| {
                             if native_managed.as_ref().is_some_and(|managed|managed[index].0&&!managed[index].1) {return false;}
+                            if cmd.skybox {return false;}
                             if *early {
                                 return true;
                             }
@@ -2854,9 +2874,10 @@ pub(crate) fn render_viewport(
                                 && p.is_none()
                         })
                         .count();
-                    work.fallback_materials.clear();
-                    for ((cmd, prepared), early) in draw_commands
-                        .iter()
+                    // per-material fallback reasons are diagnostics: rebuild them every 60 frames, not every frame
+                    let diag_frame = pixel_probe.is_some() || work.frames % 60 == 1;
+                    if diag_frame {work.fallback_materials.clear();}
+                    for ((cmd, prepared), early) in draw_commands.iter().take(if diag_frame {usize::MAX} else {0})
                         .zip(&prepared_materials)
                         .zip(&early_rejected)
                     {
@@ -2893,8 +2914,14 @@ pub(crate) fn render_viewport(
                     gl.clear_depth(1.0);
 
                     // ── Pass 1: Render Cast Shadow Map to Framebuffer ────────
+                    // The legacy shadow map only needs redrawing every other frame (the scene moves at
+                    // 30 Hz); in between, sample it with the matrix it was drawn with.
+                    cache.shadow_age = cache.shadow_age.wrapping_add(1);
+                    let refresh_shadow = enhanced_shadow || pixel_probe.is_some() || cache.shadow_vp.is_none() || cache.shadow_age % 2 == 0;
+                    let light_vp = if needs_legacy_shadow && !refresh_shadow {cache.shadow_vp.unwrap_or(light_vp)} else {light_vp};
+                    if needs_legacy_shadow && refresh_shadow {cache.shadow_vp = Some(light_vp);}
                     if let (true, Some(sfbo), Some(_)) =
-                        (needs_legacy_shadow, cache.shadow_fbo, cache.shadow_tex)
+                        (needs_legacy_shadow && refresh_shadow, cache.shadow_fbo, cache.shadow_tex)
                     {
                         gl.bind_framebuffer(glow::FRAMEBUFFER, Some(sfbo));
                         gl.viewport(0, 0, 2048, 2048);
@@ -3105,12 +3132,14 @@ pub(crate) fn render_viewport(
                         if native_managed.as_ref().is_some_and(|managed|managed[draw_index].0) {
                             let result=cache.get_or_upload_mesh(gl,&cmd.v_data,&cmd.indices)
                                 .ok_or_else(||"Native material geometry upload failed".to_owned())
-                                .and_then(|mesh|unsafe {native_material.as_ref().unwrap().lock().unwrap().draw(gl,cmd,mesh,&super::native_material::Frame {view:&view_mat,projection:&proj_mat,eye,viewport:[left,bottom,width,height],lights:&lights})});
+                                .and_then(|mesh|unsafe {native_material.as_ref().unwrap().lock().unwrap().draw(gl,cmd,mesh,&super::native_material::Frame {view:&view_mat,projection:if cmd.skybox {&sky_proj_mat} else {&proj_mat},eye,viewport:[left,bottom,width,height],lights:&lights})});
                             match result {
                                 Ok(true)=>{
                                     work.platform_native_draws+=1;work.submitted_native_draws+=1;
                                     if prepared.is_none() {
                                         work.native_draws+=1;work.fallback_draws=work.fallback_draws.saturating_sub(1);
+                                    }
+                                    if prepared.is_none() && diag_frame {
                                         let shader=cmd.material.as_ref().and_then(|m|m.shader.as_deref()).unwrap_or("<shaderless>");
                                         let reason=match &cmd.preview {Some(Err(e))=>e.as_str(),Some(Ok(_))=>"GPU resources unavailable",None=>"No native program"};
                                         let key=format!("{shader} (baked={}): {reason}",cmd.baked);
@@ -3150,11 +3179,19 @@ pub(crate) fn render_viewport(
                         // Shaderless Gamebryo surfaces still carry inherited
                         // material/alpha properties. Keep custom shader state
                         // separate from this legacy fallback.
-                        if let Some(material) = cmd.material.as_ref().filter(|m| m.shader.is_none())
+                        // EM2 Studio: effect surfaces (glows, light rays, smoke, the brush's paint card)
+                        // use custom shaders that fall back here; they blend by their NiAlphaProperty
+                        // too, and named additive effects with no alpha property add (black = clear).
+                        if let Some(material) = cmd.material.as_ref()
                         {
-                            if let Some(flags) =
-                                material.legacy_alpha_flags.filter(|flags| flags & 1 != 0)
+                            let name = format!("{} {}", material.shader.as_deref().unwrap_or(""), material.textures.first().map(|t| t.path.as_str()).unwrap_or(""));
+                            let lower = name.to_ascii_lowercase();
+                            let additive_name = ["additive", "_add_", "_add.", "halo", "lightray", "glow", "corona", "flare"].iter().any(|k| lower.contains(k));
+                            let flags = material.legacy_alpha_flags.filter(|flags| flags & 1 != 0)
+                                .or_else(|| additive_name.then_some(1 | (0 << 1) | (0 << 5)));
+                            if let Some(flags) = flags
                             {
+                                if material.shader.is_some() { gl.depth_mask(false); }
                                 let factor = |value: u16| match value {
                                     0 => Some(glow::ONE),
                                     1 => Some(glow::ZERO),
@@ -3193,12 +3230,25 @@ pub(crate) fn render_viewport(
                             false,
                             &light_vp,
                         );
+                        // The shader ignores lights for baked surfaces and in modes 0/2: skip the
+                        // per-draw light filtering and upload entirely for those.
+                        let lights_used = !cmd.baked && surfaces.mode == 0 && mode_int != 0 && mode_int != 2;
                         // Split entity groups by whitespace
-                        let entity_groups: Vec<&str> = cmd.light_group.split_whitespace().collect();
+                        let entity_groups: Vec<&str> = if lights_used {cmd.light_group.split_whitespace().collect()} else {Vec::new()};
                         let entity_is_dynamic = entity_groups.is_empty()
                             || entity_groups.iter().any(|g| is_dynamic_group(g));
+                        // world-space bounding sphere of this draw, to drop point/spot lights out of range
+                        let (center, radius) = {
+                            let c = [(cmd.aabb_min[0]+cmd.aabb_max[0])*0.5,(cmd.aabb_min[1]+cmd.aabb_max[1])*0.5,(cmd.aabb_min[2]+cmd.aabb_max[2])*0.5];
+                            let h = [(cmd.aabb_max[0]-cmd.aabb_min[0])*0.5,(cmd.aabb_max[1]-cmd.aabb_min[1])*0.5,(cmd.aabb_max[2]-cmd.aabb_min[2])*0.5];
+                            let m = &cmd.trans_mat;
+                            let w = [m[0]*c[0]+m[4]*c[1]+m[8]*c[2]+m[12], m[1]*c[0]+m[5]*c[1]+m[9]*c[2]+m[13], m[2]*c[0]+m[6]*c[1]+m[10]*c[2]+m[14]];
+                            let scale = (0..3).map(|k|(m[k*4]*m[k*4]+m[k*4+1]*m[k*4+1]+m[k*4+2]*m[k*4+2]).sqrt()).fold(0f32,f32::max);
+                            (w, (h[0]*h[0]+h[1]*h[1]+h[2]*h[2]).sqrt()*scale)
+                        };
+                        let bounded = center.iter().all(|v|v.is_finite()) && radius.is_finite();
 
-                        let filtered: Vec<&GpuLight> = lights
+                        let mut filtered: Vec<&GpuLight> = if !lights_used {Vec::new()} else {lights
                             .iter()
                             .filter(|l| {
                                 if entity_is_dynamic {
@@ -3217,7 +3267,18 @@ pub(crate) fn render_viewport(
                                     light_groups.iter().any(|lg| lg.eq_ignore_ascii_case(eg))
                                 })
                             })
-                            .collect();
+                            .collect()};
+                        // keep the first light (the shader shadows it) and any light that can reach this draw
+                        if bounded {
+                            let mut index = 0;
+                            filtered.retain(|l| {
+                                index += 1;
+                                index == 1 || !matches!(l.light_type, 2 | 3) || !(l.range > 0.0) || {
+                                    let d = [l.position[0]-center[0], l.position[1]-center[1], l.position[2]-center[2]];
+                                    (d[0]*d[0]+d[1]*d[1]+d[2]*d[2]).sqrt() <= l.range + radius
+                                }
+                            });
+                        }
 
                         let num_lights = filtered.len().min(128) as i32;
                         gl.uniform_1_i32(Some(&cache.u_num_lights), num_lights);
@@ -3384,6 +3445,14 @@ pub(crate) fn render_viewport(
                     }else if finish.active(){
                         let pass=cache.finish_pass.get_or_insert_with(||super::scene_finish::Pass::new(gl));
                         match pass{Ok(pass)=>{pass.draw(gl,[left,bottom,width,height],finish);work.finishing_frames+=1;work.finish_error=None;},Err(e)=>work.finish_error=Some(e.clone())}
+                    }
+                    // EM2's own bloom + colour correction (pp_bloom / pp_colourcorrection), from the active render profile
+                    if let Some(params)=super::em2_post::get() {
+                        gl.bind_framebuffer(glow::FRAMEBUFFER,destination_framebuffer);
+                        match cache.em2_post.get_or_insert_with(||super::em2_post::Pass::new(gl)) {
+                            Ok(pass)=>pass.draw(gl,[left,bottom,width,height],params),
+                            Err(e)=>{work.finish_error=Some(format!("EM2 post: {e}"));}
+                        }
                     }
                     if let Some(pixel)=probe_pixel {work.pixel_history.push(serde_json::json!({"stage":"resolve","rgba":read_probe_pixel(gl,pixel)}));}
                     let submission_ms = submission_started.elapsed().as_secs_f64() * 1000.;

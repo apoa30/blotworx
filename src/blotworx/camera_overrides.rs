@@ -121,15 +121,15 @@ impl Controller {
             component.class_name == "CameraOverrideComponent",
             "Not a camera override component"
         );
+        // Other override properties (pivot, side-scroll, distances...) need camera modes the
+        // playtest camera doesn't have yet: apply what's supported and say once what isn't.
+        static SEEN: std::sync::Mutex<Option<std::collections::HashSet<String>>> = std::sync::Mutex::new(None);
         for property in &component.properties {
-            ensure!(
-                matches!(
-                    property.name.as_str(),
-                    "OverridePriority" | "AutoLevelActive" | "AutoLevelSpline"
-                ),
-                "Camera override property {} requires its native camera-pass handler",
-                property.name
-            );
+            if !matches!(property.name.as_str(), "OverridePriority" | "AutoLevelActive" | "AutoLevelSpline")
+                && SEEN.lock().map(|mut s| s.get_or_insert_with(Default::default).insert(property.name.clone())).unwrap_or(false)
+            {
+                log::warn!("EM2 world service not implemented (ignored): CameraOverride.{}", property.name);
+            }
         }
         let activation = value(component, "AutoLevelActive")
             .map(|v| {

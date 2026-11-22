@@ -189,6 +189,23 @@ impl State {
                 .collect();
         }
     }
+    /// Draws attached (directly or through other attachments) to `parent`.
+    pub fn attached_draws(&self, parent: (usize, u32)) -> Vec<usize> {
+        let mut owners = vec![parent];
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < owners.len() {
+            let owner = owners[i];
+            for b in self.bindings.iter().filter(|b| b.parent == owner) {
+                if !owners.contains(&b.child) {
+                    owners.push(b.child);
+                    out.extend(&b.draws);
+                }
+            }
+            i += 1;
+        }
+        out
+    }
     pub fn update(
         &mut self,
         mut alive: impl FnMut(usize, u32) -> bool,

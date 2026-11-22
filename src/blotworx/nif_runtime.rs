@@ -219,6 +219,24 @@ impl Instance {
         Ok(())
     }
 
+    /// EM2 game-shader path: sample only the material (texture/colour) controllers.
+    pub(super) fn sample_material_controllers(&mut self, time: f32) -> Result<()> {
+        self.sample_materials(time, None)
+    }
+    pub(super) fn animates_textures_of(&self, mesh: u32) -> bool {
+        self.material_controllers.iter().any(|c| c.control.texture_transform.is_some() && c.control.target == Some(mesh))
+    }
+    /// The mesh's animated texture transforms by (shader map, slot), as apply_material builds them.
+    pub(super) fn animated_texture_transforms(&self, mesh: u32, material: &crate::render_support::nif::MaterialBindings) -> BTreeMap<(bool, u32), crate::nif_textures::UvTransform> {
+        let mut transforms = BTreeMap::new();
+        for (&(_, shader_map, slot, operation), &sample) in self.texture_transforms.range((mesh, false, 0, 0)..=(mesh, true, u32::MAX, u32::MAX)) {
+            let map = (shader_map, slot);
+            let Some(Ok(original)) = material.texture_transforms.get(&map) else { continue };
+            let transform = transforms.entry(map).or_insert_with(|| original.unwrap_or(crate::nif_textures::UvTransform { method: 2, center: [0.5; 2], ..Default::default() }));
+            super::nif_properties::DirectTextureTransform::apply(operation, sample, transform);
+        }
+        transforms
+    }
     /// Publish only writes performed by this update. Reapplying the cached
     /// pose after an Unchanged outcome would overwrite later local edits.
     pub fn update_with_writes(

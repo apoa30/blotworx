@@ -254,6 +254,12 @@ pub fn load(
                 scaled_entities.push(serde_json::json!({"entity":entity.name,"scale":scales}));
             }
             for (body_index, body) in resource.iter().enumerate() {
+                // EM2 Studio playtests: a moving (non-fixed) body under a static component (the
+                // Mean Street fire station bell, for one) is left out instead of failing the whole
+                // level's collision. BLOTWORX_STRICT_EM2=1 keeps the original rejection.
+                if body.motion_type != 5 && std::env::var_os("BLOTWORX_STRICT_EM2").is_none() {
+                    continue;
+                }
                 let result = (|| -> Result<()> {
                     ensure!(body.motion_type==5,"Static component references non-fixed body {}; runtime override requires verification",body.motion_type);
                     let owner = owners.len();

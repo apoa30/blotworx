@@ -17,6 +17,12 @@ pub struct Command {pub event:u32,pub name:String,pub context:Context}
 pub enum Pending {
     Event(Command),
     State {group:u32,state:u32,skip_transition:u8,skip_extension:u8},
+    /// Script AudioSetSwitch: per game object switch value.
+    Switch {owner:usize,group:u32,value:u32},
+    /// Script AudioStopPlaying*: a playing id, an event (by id) on an owner, or everything.
+    Stop {owner:Option<usize>,playing_id:Option<u32>,event:Option<u32>},
+    /// Script AudioSetParameter: game parameter (RTPC) value, global when owner is None.
+    Parameter {owner:Option<usize>,id:u32,value:f32},
 }
 pub trait Host {
     type Event:Copy;
@@ -82,7 +88,12 @@ impl State {
     pub fn set_state(&mut self,group:u32,state:u32) {
         self.pending.push_back(Pending::State {group,state:if state==0x2ca33bdb {0}else{state},skip_transition:0,skip_extension:0});
     }
+    /// Hand every queued command to the EM2 Studio playback layer (em2_audio_player).
+    pub fn drain(&mut self)->Vec<Pending> {self.error=None;self.pending.drain(..).collect()}
+    pub fn push(&mut self,pending:Pending) {self.pending.push_back(pending);}
     pub fn prepare_pending(&mut self,catalog:&super::em2_audio::Catalog) {
+        // diagnostic only (reads bank files from disk); events are played by em2_audio_player
+        if std::env::var_os("BLOTWORX_AUDIO_DIAG").is_none() {return}
         if self.error.is_some(){return}
         let Some(Pending::Event(command))=self.pending.front() else{
             if !self.pending.is_empty(){self.error=Some("PC state-message consumer is unconnected; command retained".into());}

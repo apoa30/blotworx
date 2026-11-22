@@ -86,7 +86,7 @@ impl Program {
 
 /// Numeric effect values are packed through CTAB dimensions/register indices.
 /// This boundary intentionally rejects unsupported casts or structures.
-pub(super) fn bind_float_constants(table:&Table,effect:&super::d3d9_effect::Effect,overrides:&BTreeMap<String,Vec<u32>>)->Result<Vec<f32>> {
+pub(super) fn bind_float_constants(table:&Table,effect:&super::d3d9_effect::Effect,overrides:&super::d3d9_draw::Params)->Result<Vec<f32>> {
     let count=table.constants.iter().filter(|c|c.register_set==2).map(|c|(c.register as usize+c.registers as usize)*4).max().unwrap_or(0);
     let mut registers=vec![0.;count];
     for constant in &table.constants {
@@ -97,7 +97,7 @@ pub(super) fn bind_float_constants(table:&Table,effect:&super::d3d9_effect::Effe
         let value=&effect.parameters.iter().find(|p|p.value.name.as_deref()==Some(&constant.name)).with_context(||format!("Missing effect parameter {}",constant.name))?.value;
         ensure!(value.kind==3&&value.class<=3,"CPU effect parameter {} is not float numeric",constant.name);
         let super::d3d9_effect::Data::Words(defaults)=&value.data else{anyhow::bail!("CPU effect parameter has no numeric data")};
-        let words=overrides.get(&constant.name).unwrap_or(defaults);
+        let words:&[u32]=overrides.get(constant.name.as_str()).map(|w|&w[..]).unwrap_or(&defaults[..]);
         let rows=constant.ty.rows as usize;let columns=constant.ty.columns as usize;let elements=constant.ty.elements.max(1) as usize;
         ensure!(rows==value.rows as usize&&columns==value.columns as usize&&elements<=value.elements.max(1) as usize,"CPU constant dimensions differ from effect parameter");
         ensure!(words.len()==defaults.len(),"CPU parameter override length mismatch");

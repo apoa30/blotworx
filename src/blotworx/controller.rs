@@ -49,19 +49,26 @@ pub struct Controller {
     pub motion_enabled:bool,
     pub camera_yaw: f32,
     pub camera_pitch: f32,
+    /// Camera pitch range in radians (positive = above, looking down).
+    pub pitch_limits: [f32; 2],
     accumulator: f64,
     jump_pending: bool,
     camera_pending: [f32; 2],
     pub ticks: u64,
+    /// EM2 skid / 180 turn (360 MickeyPlayerMotionController), when the player authors it.
+    pub moves: Option<super::locomotion_actions::Em2Driver>,
 }
 
 impl Controller {
     pub fn new(player: Player) -> Self {
+        let moves = player.motion.em2_moves.clone().map(|s| super::locomotion_actions::Em2Driver::new(s, player.motion.turn_min_allowed_speed));
         Self {
+            moves,
             player,
             motion_enabled:true,
             camera_yaw: 1.6,
             camera_pitch: 0.28,
+            pitch_limits: [-0.15, 1.25],
             accumulator: 0.,
             jump_pending: false,
             camera_pending: [0.; 2],
@@ -231,7 +238,7 @@ impl Controller {
             self.camera_yaw += self.camera_pending[0] - tick_input.camera_stick[0] * STEP * 2.5;
             self.camera_pitch = (self.camera_pitch + self.camera_pending[1]
                 - tick_input.camera_stick[1] * STEP * 2.)
-                .clamp(-0.15, 1.25);
+                .clamp(self.pitch_limits[0], self.pitch_limits[1]);
             self.camera_pending = [0.; 2];
             let (sin, cos) = self.camera_yaw.sin_cos();
             let (sp, cp) = self.camera_pitch.sin_cos();
@@ -250,6 +257,13 @@ impl Controller {
                 .player
                 .try_filter_stick(tick_input.movement.map(|v| -v), STEP)
                 .map_err(|error| AdvanceError::Input(error.to_string()))?;
+            if let Some(moves) = self.moves.as_mut() {
+                // Skid / 180 read the raw stick: the filtered stick rotates too slowly (InputRotationVelocity)
+                // to ever reach The180Cosine inside The180TimeToCheck.
+                let raw = tick_input.movement.map(|v| -v);
+                let desired = input::movement_direction(raw, reference);
+                moves.tick(&mut self.player, desired, STEP);
+            }
             self.player.prepare_input_step(
                 collision(context),
                 filtered,

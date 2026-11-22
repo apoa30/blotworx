@@ -145,7 +145,7 @@ impl Effect {
     }
     /// Resolve both direct GPU constants and CPU expressions from the same
     /// effect parameter set. Shader-defined DEF constants remain in GPU code.
-    pub fn constant_banks(&self,pass:&TranslatedPass,overrides:&BTreeMap<String,Vec<u32>>,precision:super::d3d9_preshader::TemporaryPrecision)->Result<PassConstants> {
+    pub fn constant_banks(&self,pass:&TranslatedPass,overrides:&super::d3d9_draw::Params,precision:super::d3d9_preshader::TemporaryPrecision)->Result<PassConstants> {
         let layout=self.layout.as_ref().map_err(|error|anyhow::anyhow!("{error}"))?;
         let stage=|index:usize,translation:&super::d3d9_translate::Translation,limit:usize|->Result<StageConstants>{
             let program=self.programs.get(index).context("Pass shader program is absent")?;

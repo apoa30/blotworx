@@ -3,6 +3,7 @@ mod em2;
 mod em2_global_state;
 mod em2_quest_path;
 mod em2_music;
+mod em2_tex_anim;
 mod compiled_level;
 mod em2_level_manager;
 mod sequence44;
@@ -61,6 +62,10 @@ mod d3d9_vertices;
 mod d3d9_translate;
 mod player_constraints;
 mod em2_camera_manager;
+mod em2_follow_camera;
+mod authored_motion;
+mod em2_cursor_camera;
+mod em2_audio_player;
 mod animation_chunks;
 mod igc_timeline;
 mod gamebryo_camera;
@@ -886,7 +891,7 @@ fn options() -> Result<Options> {
         o.updates = true;
     }
     while let Some(a) = args.next() {
-        if !diagnostic && !matches!(a.as_str(), "--help" | "-h" | "--data" | "--level" | "--continue") {
+        if !diagnostic && !matches!(a.as_str(), "--help" | "-h" | "--data" | "--level" | "--continue" | "--shared-playtest") {
             anyhow::bail!("Unknown launch option {a}. Use the in-game menus or run blotworx diagnose --help for developer tools.");
         }
         match a.as_str() {
@@ -4212,40 +4217,12 @@ impl Engine {
 }
 impl Engine {
     fn draw_options(&mut self,ctx:&egui::Context) {
-        if ctx.input(|i|i.key_pressed(egui::Key::F10)){self.options_open=!self.options_open;}
-        let progress=ctx.animate_bool_with_time(egui::Id::new("options_slide"),self.options_open,0.22);
-        if progress<=0.001{return}
-        let screen=ctx.content_rect();let height=(screen.height()-32.).min(430.).max(160.);
-        let width=(screen.width()-32.).min(960.).max(240.);
         let before=serde_json::to_vec(&self.preferences).unwrap_or_default();
-        egui::Area::new(egui::Id::new("blotworx_options")).order(egui::Order::Foreground)
-          .fixed_pos(egui::pos2(screen.center().x-width*0.5,16.-(height+24.)*(1.-progress)))
-          .show(ctx,|ui|{
-            egui::Frame::new().fill(egui::Color32::from_rgb(17,20,25))
-              .stroke(egui::Stroke::new(1.,egui::Color32::from_rgb(62,69,77))).corner_radius(10.)
-              .inner_margin(20.).show(ui,|ui|{
-                ui.visuals_mut().selection.bg_fill=egui::Color32::from_rgb(44,94,94);
-                ui.visuals_mut().widgets.inactive.bg_fill=egui::Color32::from_rgb(28,33,40);
-                ui.spacing_mut().item_spacing=egui::vec2(10.,8.);
-                ui.set_width(width-40.);ui.set_min_height(height-40.);
-                ui.horizontal_wrapped(|ui|{ui.strong("BLOTWORX");ui.add_space(24.);
-                  for (i,n) in ["Graphics","Display & controls","Game","Tools"].iter().enumerate(){ui.selectable_value(&mut self.options_tab,i,*n);}
-                  ui.with_layout(egui::Layout::right_to_left(egui::Align::Center),|ui|{if ui.button("Close Â· F10").clicked(){self.options_open=false;}});
-                });ui.separator();ui.add_space(10.);
-                egui::ScrollArea::vertical().max_height(height-100.).show(ui,|ui|{
-                  match self.options_tab {
+        let (mut open,mut tab)=(self.options_open,self.options_tab);
+        options_menu::panel(ctx,&mut open,&mut tab,|ui,selected|{
+                  match selected {
                    0=>self.preferences.graphics(ui),
-                   1=>{
-                    if ui.checkbox(&mut self.preferences.fullscreen,"Fullscreen").changed(){ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.preferences.fullscreen));}
-                    ui.horizontal_wrapped(|ui|{ui.label("Window size");for (w,h) in [(1280.,720.),(1920.,1080.),(2560.,1440.)]{if ui.button(format!("{} Ã— {}",w as u32,h as u32)).clicked(){self.preferences.fullscreen=false;ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(w,h)));}}});
-                    ui.checkbox(&mut self.preferences.hud,"Show HUD");
-                    ui.add(egui::Slider::new(&mut self.preferences.sensitivity,0.2..=3.).text("Camera sensitivity"));
-                    ui.checkbox(&mut self.preferences.invert_y,"Invert vertical camera");
-                    if ui.add(egui::Slider::new(&mut self.preferences.distance,2.0..=16.0).text("Camera distance")).changed(){self.zoom=self.preferences.distance;}
-                    ui.add(egui::Slider::new(&mut self.preferences.fov,40.0..=100.0).text("Gameplay field of view"));
-                    ui.add_space(12.);ui.weak("WASD Â· Move     Space Â· Jump     Q / E Â· Paint / Thinner     F Â· Spin");
-                    ui.weak("Right drag Â· Camera     Wheel Â· Zoom     Esc Â· Pause     F3 Â· Debug");
-                   },
+                   1=>{if self.preferences.display_controls(ui,ctx){self.zoom=self.preferences.distance;}},
                    2=>{
             ui.collapsing("Game data", |ui| {
                 ui.add_enabled_ui(self.receiver.is_none(), |ui| {
@@ -4366,9 +4343,8 @@ impl Engine {
                     }
                    }
                   }
-                });
-              });
-          });
+        });
+        self.options_open=open;self.options_tab=tab;
         if serde_json::to_vec(&self.preferences).unwrap_or_default()!=before {self.preferences_dirty=true;}
         if self.preferences_dirty && !ctx.input(|i|i.pointer.any_down()) {
           match self.preferences.save(){Ok(())=>self.preferences_dirty=false,Err(error)=>self.error=Some(format!("Settings: {error:#}"))}

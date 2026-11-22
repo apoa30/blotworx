@@ -509,7 +509,7 @@ fn run(receiver: mpsc::Receiver<Command>, endpoint: endpoint::Endpoint, gate: &G
 }
 
 #[cfg(windows)]
-mod endpoint {
+pub(super) mod endpoint {
     use super::*;
     use std::cell::UnsafeCell;
     #[repr(C, packed)]
@@ -655,10 +655,10 @@ mod endpoint {
 }
 #[cfg(target_os = "android")]
 #[path = "audio_output_android.rs"]
-mod endpoint;
+pub(super) mod endpoint;
 
 #[cfg(not(any(windows, target_os = "android")))]
-mod endpoint {
+pub(super) mod endpoint {
     use super::*;
     pub struct Endpoint;
     pub struct Buffer;

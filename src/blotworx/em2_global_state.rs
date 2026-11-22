@@ -44,9 +44,18 @@ impl State {
     ) -> mlua::Result<mlua::MultiValue> {
         use mlua::{FromLua, Value};
         if !matches!(name, "GetGlobal" | "SetGlobal") {
-            return Err(mlua::Error::external(format!(
-                "EM2 world service is not implemented: {name}"
-            )));
+            // EM2 Studio playtests: a service that isn't implemented yet does nothing (logged once)
+            // instead of stopping the level's scripts. BLOTWORX_STRICT_EM2=1 restores the error.
+            if std::env::var_os("BLOTWORX_STRICT_EM2").is_some() {
+                return Err(mlua::Error::external(format!(
+                    "EM2 world service is not implemented: {name}"
+                )));
+            }
+            static SEEN: std::sync::Mutex<Option<std::collections::HashSet<String>>> = std::sync::Mutex::new(None);
+            if SEEN.lock().unwrap().get_or_insert_with(Default::default).insert(name.to_string()) {
+                log::warn!("EM2 world service not implemented (ignored): {name}");
+            }
+            return Ok(mlua::MultiValue::new());
         }
         let key = String::from_lua(args.front().cloned().unwrap_or(Value::Nil), lua)?;
         let result = if name == "GetGlobal" {

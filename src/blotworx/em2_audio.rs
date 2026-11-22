@@ -47,7 +47,9 @@ impl Catalog {
         // MainMenu.lvlc declares Global.bnk; PC AudioAssetManager::UnloadBank
         // b13b81..b13b91 explicitly protects it across level transitions.
         // Direct level bootstraps must retain that persistent boot bank too.
-        let initial=["Init.bnk".to_owned(),"Global.bnk".to_owned()];
+        // global_localized.bnk (Localize/<language>) holds Mickey's and Oswald's voice sounds
+        // (jump grunt, double jump, fall yell...) and is resident like Global.bnk.
+        let initial=["Init.bnk".to_owned(),"Global.bnk".to_owned(),"global_localized.bnk".to_owned()];
         for name in initial.iter().chain(names) {
             if !seen.insert(name.to_ascii_lowercase()) {continue;}
             let loaded = (|| -> Result<()> {
@@ -88,6 +90,10 @@ impl Catalog {
         result
     }
     pub fn has_event(&self,id:u32)->bool {self.events.contains_key(&id)}
+    /// Paths of every mounted bank, in load order (Init, Global, then the level's banks).
+    pub fn bank_files(&self)->Vec<PathBuf> {
+        self.banks.iter().filter_map(|b|self.paths.get(&b.id).and_then(|p|p.first().cloned())).collect()
+    }
     pub fn event(&self, name: &str) -> Result<&[Event]> {
         let id=event_id(name)?;
         self.events.get(&id).map(Vec::as_slice).with_context(||format!("PC audio event {name} ({id:08x}) is absent from mounted level banks"))

@@ -12,6 +12,7 @@ pub(crate) mod native_material;
 pub(crate) mod nif;
 pub(crate) mod scene;
 pub(crate) mod scene_finish;
+pub(crate) mod em2_post;
 #[cfg(any(test, debug_assertions))]
 pub(crate) mod shader;
 pub(crate) mod spatial_lights;

@@ -429,6 +429,35 @@ impl Runtime {
     pub fn draw_playtest_dialogue(&mut self,ui:&egui::Ui,pad_edges:u16,globals:&mut super::em2_global_state::State,scripts:&mut Scripts) {
         if let Err(error)=self.sequences.draw_playtest(ui,pad_edges,globals,|source,owner|scripts.schedule_story_source(source,owner)){self.error.get_or_insert_with(||format!("Dialogue presentation: {error:#}"));}
     }
+    /// An animation clip's sound trigger, posted on the actor's own entity like the game does.
+    pub fn post_actor_sound(&mut self,scene:usize,entity:u32,name:&str)->Result<()> {
+        let Some(&owner)=self.source_owners.get(&(scene,entity)) else {return Ok(())};
+        if self.retired.contains(&owner) {return Ok(());}
+        self.audio_posts.post(&self.audio,owner,name)?;Ok(())
+    }
+    /// Queued audio commands for the EM2 playback layer, and the bank files they refer to.
+    pub fn take_audio(&mut self)->Vec<super::audio_post72::Pending> {self.audio_posts.drain()}
+    /// Raw dump of every JPSLightComponent (BLOTWORX_LIGHT_DUMP=path): name, position and all properties.
+    pub fn dump_lights(&self,path:&std::path::Path) {
+        let rows:Vec<_>=self.entities.iter().enumerate().filter(|(owner,_)|!self.retired.contains(owner)).flat_map(|(_,e)|e.components.iter().filter(|c|c.class_name=="JPSLightComponent"||c.class_name=="JPSLightBakingComponent"||c.class_name=="RenderSceneEffectsComponent").map(move |c|serde_json::json!({
+            "entity":e.name,"class":c.class_name,"position":&e.transform[12..15],
+            "properties":c.properties.iter().map(|p|(p.name.clone(),p.value.clone())).collect::<serde_json::Map<_,_>>()}))).collect();
+        let _=std::fs::write(path,serde_json::to_string_pretty(&rows).unwrap_or_default());
+    }
+    /// The runtime SH light list (360 0x827a34f8 / 0x8279ffc8): every JPSLightBakingComponent with
+    /// GenerateRuntimeLight, in registration order. Raycasts stay off (the 360 only reads the raycast
+    /// flag when a global switch is set). Invalid sources give an empty list plus the error text.
+    pub fn sh_light_records(&mut self)->(Vec<std::sync::Arc<super::d3d9_sh::LightRecord>>,Option<String>) {
+        match self.pc_light_sources.records(super::pc_float::Precision::Extended,false) {
+            Ok(rows)=>(rows.into_iter().map(|(_,record)|record).collect(),None),
+            Err(error)=>(Vec::new(),Some(format!("{error:#}"))),
+        }
+    }
+    pub fn audio_bank_files(&self)->Vec<std::path::PathBuf> {self.audio.bank_files()}
+    /// World position of a placed entity (audio emitters); None for the global object.
+    pub fn entity_position(&self,owner:usize)->Option<[f32;3]> {
+        let m=&self.entities.get(owner)?.transform;Some([m[12],m[13],m[14]])
+    }
     pub fn player_position(&self) -> [f32; 3] {
         let m = &self.entities[self.player].transform;
         [m[12], m[13], m[14]]
@@ -607,6 +636,7 @@ impl Runtime {
                     Err(error)=>source_errors.push(serde_json::json!({"entity":entity.name,"component":component.class_name,"error":format!("{error:#}")})),}
             }
         }
+        Self::prepare_prefabs(&entities,scripts,&mut source_errors)?;
         let sequences=super::em2_sequences::Catalog::load(&entities,files)?;
         let igc=super::igc::Catalog::load(files);
         let gamebryo_cameras=super::gamebryo_camera::State::load(&entities,files,igc.camera_targets());
@@ -659,6 +689,78 @@ impl Runtime {
             time: 0.,
             source_errors,disabled_usables:HashSet::new(),usable_owners,uses_started:0,last_usable:None,pending_collision_retirements:VecDeque::new(),
         })
+    }
+    /// Prefab Lua data and membership, as EM1's entity initialization does: GetPrefabData needs
+    /// each JPSPrefabComponent's table, and members share their root's table. Nested prefabs:
+    /// smaller prefabs bind first and a member keeps the first (innermost) prefab it joins.
+    fn prefab_members(entity:&RuntimeEntity)->Result<Vec<u32>> {
+        let mut out=Vec::new();
+        for component in entity.components.iter().filter(|c|c.class_name=="JPSPrefabComponent") {
+            for p in component.properties.iter().filter(|p|p.name=="Prefab Entities") {
+                for id in p.value.as_array().context("Prefab Entities must be an array")? {
+                    let id=u32::try_from(id.as_u64().context("Invalid prefab member identity")?)?;
+                    if id!=0 {out.push(id);}
+                }
+            }
+        }
+        Ok(out)
+    }
+    fn prepare_prefabs(entities:&[RuntimeEntity],scripts:&mut Scripts,errors:&mut Vec<serde_json::Value>)->Result<()> {
+        let mut roots=Vec::new();
+        for (owner,entity) in entities.iter().enumerate() {
+            let prefabs=entity.components.iter().filter(|c|c.class_name=="JPSPrefabComponent").collect::<Vec<_>>();
+            let Some(component)=prefabs.first() else {continue};
+            let result=(||->Result<()> {
+                ensure!(prefabs.len()==1,"Multiple prefab components on one entity");
+                let rows=|name:&str|->Result<Vec<String>> {
+                    let Some(p)=component.properties.iter().find(|p|p.name==name) else {return Ok(Vec::new())};
+                    p.value.as_array().with_context(||format!("{name} must be an array"))?.iter()
+                        .map(|row|row.as_str().map(str::to_owned).with_context(||format!("{name} row must be a string"))).collect()
+                };
+                scripts.prepare_prefab_data(owner,&rows("Prefab Data")?,&rows("Prefab Data Override")?)
+            })();
+            match result {
+                Ok(())=>roots.push(owner),
+                Err(error)=>errors.push(serde_json::json!({"entity":entity.name,"component":"JPSPrefabComponent","error":format!("Prefab Lua data: {error:#}")})),
+            }
+        }
+        let identities=entities.iter().enumerate().map(|(i,e)|((e.scene.as_str(),e.id),i)).collect::<HashMap<_,_>>();
+        let mut sized=Vec::new();
+        for owner in roots {
+            match Self::prefab_members(&entities[owner]) {
+                Ok(members)=>sized.push((members.len(),owner,members)),
+                Err(error)=>errors.push(serde_json::json!({"entity":entities[owner].name,"component":"JPSPrefabComponent","error":format!("Prefab Lua ownership: {error:#}")})),
+            }
+        }
+        sized.sort_by_key(|(len,owner,_)|(*len,*owner));
+        for (_,owner,members) in sized {
+            for id in members {
+                // a member in another loaded scene, or not loaded in this state, has no table
+                let Some(&member)=identities.get(&(entities[owner].scene.as_str(),id)) else {continue};
+                if member==owner || scripts.prefab_owner(member)?.is_some() {continue;}
+                if let Err(error)=scripts.bind_prefab_member(member,owner) {
+                    errors.push(serde_json::json!({"entity":entities[member].name,"component":"JPSPrefabComponent","error":format!("Prefab Lua ownership: {error:#}")}));
+                }
+            }
+        }
+        Ok(())
+    }
+    /// GetRelativePrefabEntity(owner, suffix): the owner's prefab member whose IO EntityGroups
+    /// holds exactly `suffix` (EM1 REL34d8b0 semantics; the rendered name isn't compared).
+    fn relative_prefab_entity(&self,registry:&Scripts,owner:usize,suffix:&str)->Result<Option<usize>> {
+        let root=registry.prefab_owner(owner)?.unwrap_or(owner);
+        let Some(root_entity)=self.entities.get(root) else {return Ok(None)};
+        for id in Self::prefab_members(root_entity)? {
+            let Some(index)=self.entities.iter().position(|e|e.scene==root_entity.scene&&e.id==id) else {continue};
+            if self.retired.contains(&index) {continue;}
+            for io in self.entities[index].components.iter().filter(|c|c.class_name=="InputOutputComponent") {
+                let Some(groups)=property(io,"EntityGroups") else {continue};
+                for group in groups.as_array().context("Prefab member EntityGroups must be an array")? {
+                    if group.as_str()==Some(suffix) {return Ok(Some(index));}
+                }
+            }
+        }
+        Ok(None)
     }
     pub fn install_children(&mut self,graph:&super::em2_children::Graph)->Result<()> {
         self.templates=Some(graph.templates.clone());
@@ -839,11 +941,16 @@ impl Runtime {
         let entity=&self.entities[owner];
         let trigger=entity.components.iter().any(|c|c.class_name=="PhysicsTriggerComponent");
         let usable=entity.components.iter().any(|c|c.class_name=="UsableComponent");
-        ensure!((trigger||usable)&&entity.components.iter().all(|c|matches!(c.class_name.as_str(),
-            "JPSTransformationComponent"|"InputOutputComponent"|"PhysicsTriggerComponent"|"UsableComponent"|"ChildComponent"|"FXComponent")),
-            "PC component enable/disable receivers for {} are not connected",entity.name);
-        ensure!(!trigger||self.volumes.iter().any(|v|v.owner==owner),
-            "{} has no admitted player trigger volume; other trigger receivers are pending",entity.name);
+        // Triggers and usables are enabled/disabled here. Other component kinds have no enable
+        // receiver in the playtest yet: they keep running, and each kind is reported once instead
+        // of stopping the level's scripts. Triggers that don't touch the player have no volume.
+        static SEEN:std::sync::Mutex<Option<HashSet<String>>>=std::sync::Mutex::new(None);
+        for c in &entity.components {
+            if !matches!(c.class_name.as_str(),"JPSTransformationComponent"|"InputOutputComponent"|"PhysicsTriggerComponent"|"UsableComponent"|"ChildComponent"|"FXComponent")
+                && SEEN.lock().map(|mut s|s.get_or_insert_with(Default::default).insert(c.class_name.clone())).unwrap_or(false) {
+                log::warn!("EM2 world service not implemented (ignored): Enable/Disable.{}",c.class_name);
+            }
+        }
         let position=self.player_position();
         for volume in self.volumes.iter_mut().filter(|v|v.owner==owner) {
             if volume.disabled==disabled{continue;}
@@ -974,11 +1081,20 @@ impl Runtime {
         use mlua::{FromLua,Value};
         match name {
             "AnimGBSequence"=>{
-                if args.len()>2{return Err(mlua::Error::external("PC animation restart/speed/time options are not connected"));}
+                // Optional restart/speed/start-time arguments (e.g. Prefab_Animate_Doors) are accepted;
+                // the sequence still starts from its beginning at normal speed.
                 let owner=registry.resolve_native_entity_argument(lua,args.front().cloned().unwrap_or(Value::Nil))?;
                 let name=lua.coerce_string(args.get(1).cloned().unwrap_or(Value::Nil))?
                     .map(|s|s.to_str().map(|s|s.to_owned())).transpose()?.unwrap_or_default();
-                if let Some(owner)=owner.filter(|_|!name.is_empty()) {self.gamebryo_cameras.request(owner,&name).map_err(mlua::Error::external)?;}
+                if let Some(owner)=owner.filter(|_|!name.is_empty()) {
+                    if self.gamebryo_cameras.prepared(owner) {self.gamebryo_cameras.request(owner,&name).map_err(mlua::Error::external)?;}
+                    else {
+                        // Only NIF cameras are animated by this runtime so far; props (doors etc.)
+                        // keep their pose instead of halting the level's scripts.
+                        static ONCE:std::sync::Once=std::sync::Once::new();
+                        ONCE.call_once(||log::warn!("EM2 world service not implemented (ignored): AnimGBSequence(non-camera)"));
+                    }
+                }
                 Ok(mlua::MultiValue::new())
             }
             "GrabCameraNif"=>{
@@ -1087,6 +1203,26 @@ impl Runtime {
                 }
                 Ok(mlua::MultiValue::new())
             },
+            // No health/costume systems in the EM2 playtest yet. Return safe values so scripts
+            // that compare them don't fail on nil: the entity's authored health if it has one
+            // (else 1, i.e. alive), and an empty costume name (the default outfit).
+            "GetHealth"=>{
+                let owner=registry.resolve_native_entity_argument(lua,args.front().cloned().unwrap_or(Value::Nil))?;
+                let authored=owner.and_then(|o|self.entities.get(o)).and_then(|e|e.components.iter().flat_map(|c|c.properties.iter())
+                    .find(|p|p.name.contains("Health")&&p.value.is_number()).and_then(|p|p.value.as_f64()));
+                Ok(mlua::MultiValue::from_vec(vec![Value::Number(authored.filter(|h|*h>0.).unwrap_or(1.))]))
+            }
+            "GetCurrentCostumeName"=>Ok(mlua::MultiValue::from_vec(vec![Value::String(lua.create_string("")?)])),
+            "GetRelativePrefabEntity"=>{
+                let mut values=args.into_vec();
+                if values.len()!=2 {return Err(mlua::Error::external("Relative prefab lookup requires owner and suffix"));}
+                let suffix=lua.coerce_string(values.pop().unwrap())?.ok_or_else(||mlua::Error::external("Relative prefab suffix is not a string"))?;
+                let suffix=suffix.to_str()?.split('\0').next().unwrap_or("").to_owned();
+                let owner=registry.resolve_native_entity_argument(lua,values.pop().unwrap())?.filter(|o|!self.retired.contains(o));
+                let found=match owner {Some(owner)=>self.relative_prefab_entity(registry,owner,&suffix).map_err(mlua::Error::external)?,None=>None};
+                // EM1 returns entity name 0 (not nil) when nothing matches
+                Ok(mlua::MultiValue::from_vec(vec![match found {Some(index)=>registry.entity_value(index)?,None=>Value::Integer(0)}]))
+            }
             "LevelManager_GetCurrentLevelName"|"LevelManager_GetCurrentState"|"LevelManager_GetCurrentInterior"|"LevelManager_SetCurrentState"=>self.level.call(lua,name,args),
             "FireSequence"=>{
                 let mut args=args.into_vec();let count=args.len();
@@ -1119,6 +1255,30 @@ impl Runtime {
                 let playing=self.audio_posts.post(&self.audio,owner.unwrap(),name).map_err(mlua::Error::external)?;
                 Ok(mlua::MultiValue::from_vec(vec![Value::Integer(i64::from(playing))]))
             }
+            "AudioSetState"|"AudioSetSwitch"|"AudioStopPlaying"|"AudioStopPlayingOn"|"AudioStopPlayingAll"|"AudioSetParameter"=>{
+                // names (states, switches, parameters, events) use the same Wwise name hash as events
+                use super::audio_post72::Pending;
+                let args=args.into_vec();
+                let hash=|text:&str|super::em2_audio::event_id(text.split('\0').next().unwrap_or_default()).map_err(mlua::Error::external);
+                let strings:Vec<String>=args.iter().filter_map(|v|match v {Value::String(s)=>Some(s.to_string_lossy().to_string()),_=>None}).collect();
+                let number=args.iter().rev().find_map(|v|match v {Value::Number(n)=>Some(*n),Value::Integer(i)=>Some(*i as f64),_=>None});
+                let owner=match args.iter().find(|v|!matches!(v,Value::String(_)|Value::Number(_)|Value::Nil)) {
+                    Some(v)=>registry.resolve_native_entity_argument(lua,v.clone())?.filter(|o|!self.retired.contains(o)),
+                    None=>None,
+                };
+                let pending=match name {
+                    "AudioSetState" if strings.len()>=2=>Pending::State {group:hash(&strings[strings.len()-2])?,state:{let s=hash(&strings[strings.len()-1])?;if s==0x2ca33bdb {0}else{s}},skip_transition:0,skip_extension:0},
+                    "AudioSetSwitch" if strings.len()>=2=>Pending::Switch {owner:owner.unwrap_or(0x7fffffff),group:hash(&strings[strings.len()-2])?,value:hash(&strings[strings.len()-1])?},
+                    "AudioStopPlayingAll"=>Pending::Stop {owner:None,playing_id:None,event:None},
+                    "AudioStopPlaying"|"AudioStopPlayingOn"=>Pending::Stop {owner,
+                        playing_id:args.iter().find_map(|v|match v {Value::Integer(i)=>Some(*i as u32),Value::Number(n)=>Some(*n as u32),_=>None}),
+                        event:strings.last().map(|s|hash(s)).transpose()?},
+                    "AudioSetParameter" if !strings.is_empty()=>Pending::Parameter {owner,id:hash(&strings[strings.len()-1])?,value:number.unwrap_or(0.) as f32},
+                    _=>return Ok(mlua::MultiValue::new()),
+                };
+                self.audio_posts.push(pending);
+                Ok(mlua::MultiValue::new())
+            }
             "Quest_SetCriticalPath"|"Quest_GetCriticalPath"=>self.quest_path.call(lua,name,args),
             "SetPropertyFloat"|"GetPropertyFloat"=>{
                 let request=super::em2_float_property::Request::parse(lua,name=="SetPropertyFloat",args)?;
@@ -1133,6 +1293,43 @@ impl Runtime {
                 if name=="SetActiveSubMap" {self.maps.set_sub_map(owner);}else{self.maps.set_full_map(owner);}
                 Ok(mlua::MultiValue::new())
             }
+            "ClearCameraAttributes"|"ClearCameraAttributesForPlayer"=>{
+                // Inverse of SetCameraAttributes: drop this override from every slot's stack and
+                // apply the next one. When the stack empties, return to the default camera the same
+                // way ClearAllCameraAttributes does (default duration).
+                let mut args=args;
+                let target=if name=="ClearCameraAttributesForPlayer"&&args.len()>1 {registry.resolve_native_entity_argument(lua,args.pop_back().unwrap())?}else{None};
+                let Some(owner)=registry.resolve_native_entity_argument(lua,args.pop_back().unwrap_or(Value::Nil))? else {return Ok(mlua::MultiValue::new());};
+                let mut emptied=Vec::new();
+                for index in 0..2 {
+                    if target.is_some()&&self.players[index].entity!=target {continue;}
+                    if !self.cameras[index].overrides.owners.contains(&owner) {continue;}
+                    self.cameras[index].overrides.owners.retain(|o|*o!=owner);
+                    let entities=&self.entities;let retired=&self.retired;
+                    let changed=self.cameras[index].overrides.refresh(|candidate| {
+                        if retired.contains(&candidate)||!registry.has_entity(candidate){return Ok(None);}
+                        let component=entities[candidate].components.iter().find(|c|c.class_name=="CameraOverrideComponent").context("Camera stack owner lost its override component")?;
+                        Ok(Some(super::camera_overrides::priority(component)?))
+                    }).map_err(mlua::Error::external)?;
+                    match self.cameras[index].overrides.selected {
+                        Some(selected) if changed=>{
+                            let component=self.entities[selected].components.iter().find(|c|c.class_name=="CameraOverrideComponent").context("Selected camera override is absent").map_err(mlua::Error::external)?;
+                            let ids=&self.ids;
+                            self.cameras[index].apply(selected,component,|id|ids.get(&id).copied().map(Some).with_context(||format!("Unresolved camera auto-level spline GUID {id}"))).map_err(mlua::Error::external)?;
+                        }
+                        None=>emptied.push(index),
+                        _=>{}
+                    }
+                }
+                if !emptied.is_empty() && self.pending_camera_clear.is_none() && self.camera_manager.is_some() {
+                    self.pending_camera_clear=Some(super::em2_camera_reset::Pending {slots:emptied,duration:-1.,next_slot:0});
+                    self.drain_camera_clear().map_err(|error|mlua::Error::external(format!("{error:#}")))?;
+                }
+                Ok(mlua::MultiValue::new())
+            }
+            // App-level viewport culling (used by building-exit cameras). Blotworx draws one
+            // full-screen viewport and culls by camera already, so there is nothing to change.
+            "SetAppCulledViewport"|"ClearAppCulledViewport"=>Ok(mlua::MultiValue::new()),
             "SetCameraAttributes"|"SetCameraAttributesForPlayer"=>{self.set_camera_attributes(registry,lua,args,name=="SetCameraAttributesForPlayer").map_err(mlua::Error::external)?;Ok(mlua::MultiValue::new())},
             "ClearAllCameraAttributes"=>{
                 let request=super::em2_camera_reset::Request::parse(lua,args)?;
