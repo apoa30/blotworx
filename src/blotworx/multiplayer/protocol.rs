@@ -15,6 +15,10 @@ pub const FLAG_SPRAY_PAINT: u8 = 1 << 3;
 pub const FLAG_SPRAY_THINNER: u8 = 1 << 4;
 pub const FLAG_SPEAKING: u8 = 1 << 5;
 
+/// Client-to-host co-op world action kinds.
+pub const ACTION_PAINT_PIECE: u8 = 1;
+pub const ACTION_LEVEL_READY: u8 = 2;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PantsColor {
     pub name: &'static str,
@@ -109,6 +113,8 @@ pub struct NetPlayerState {
     pub yaw: f32,
     pub flags: u8,
     pub anim_speed: f32,
+    pub anim_clip_hash: u32,
+    pub anim_time: f32,
     pub level_hash: u32,
 }
 
@@ -172,6 +178,25 @@ pub enum Packet {
         player_id: u8,
         color_slot: u8,
     },
+    /// Host -> Clients: zlib-compressed authoritative level state (globals, quests, jigsaws, hidden/moved entities).
+    WorldSync {
+        level_hash: u32,
+        seq: u32,
+        payload: Vec<u8>,
+    },
+    /// Client -> Host: co-op action (paint/thinner hit or client finished loading level & requests full sync).
+    WorldAction {
+        player_id: u8,
+        kind: u8,
+        a: u32,
+        b: u8,
+    },
+    /// Client -> Host: request party-wide level transition when a client reaches a level exit/projector.
+    LevelTransitionReq {
+        player_id: u8,
+        level: String,
+        clean: bool,
+    },
 }
 
 const TAG_JOIN_REQ: u8 = 1;
@@ -186,6 +211,9 @@ const TAG_VOICE: u8 = 9;
 const TAG_LEVEL_CHANGE: u8 = 10;
 const TAG_HEARTBEAT: u8 = 11;
 const TAG_COLOR_CHANGE: u8 = 12;
+const TAG_WORLD_SYNC: u8 = 13;
+const TAG_WORLD_ACTION: u8 = 14;
+const TAG_LEVEL_TRANSITION_REQ: u8 = 15;
 
 fn put_u8(out: &mut Vec<u8>, v: u8) {
     out.push(v);
@@ -217,6 +245,8 @@ fn put_state(out: &mut Vec<u8>, s: &NetPlayerState) {
     put_f32(out, s.yaw);
     put_u8(out, s.flags);
     put_f32(out, s.anim_speed);
+    put_u32(out, s.anim_clip_hash);
+    put_f32(out, s.anim_time);
     put_u32(out, s.level_hash);
 }
 fn put_info(out: &mut Vec<u8>, p: &PlayerInfo) {
@@ -267,6 +297,8 @@ impl<'a> Reader<'a> {
             yaw: self.f32()?,
             flags: self.u8()?,
             anim_speed: self.f32()?,
+            anim_clip_hash: self.u32()?,
+            anim_time: self.f32()?,
             level_hash: self.u32()?,
         })
     }
@@ -388,6 +420,40 @@ impl Packet {
                 put_u8(&mut out, *player_id);
                 put_u8(&mut out, *color_slot);
             }
+            Packet::WorldSync {
+                level_hash,
+                seq,
+                payload,
+            } => {
+                put_u8(&mut out, TAG_WORLD_SYNC);
+                put_u32(&mut out, *level_hash);
+                put_u32(&mut out, *seq);
+                let len = payload.len().min(60_000);
+                put_u16(&mut out, len as u16);
+                out.extend_from_slice(&payload[..len]);
+            }
+            Packet::WorldAction {
+                player_id,
+                kind,
+                a,
+                b,
+            } => {
+                put_u8(&mut out, TAG_WORLD_ACTION);
+                put_u8(&mut out, *player_id);
+                put_u8(&mut out, *kind);
+                put_u32(&mut out, *a);
+                put_u8(&mut out, *b);
+            }
+            Packet::LevelTransitionReq {
+                player_id,
+                level,
+                clean,
+            } => {
+                put_u8(&mut out, TAG_LEVEL_TRANSITION_REQ);
+                put_u8(&mut out, *player_id);
+                put_str(&mut out, level);
+                put_u8(&mut out, u8::from(*clean));
+            }
         }
         out
     }
@@ -482,6 +548,28 @@ impl Packet {
                 player_id: r.u8()?,
                 color_slot: r.u8()?,
             }),
+            TAG_WORLD_SYNC => {
+                let level_hash = r.u32()?;
+                let seq = r.u32()?;
+                let len = r.u16()? as usize;
+                let payload = r.take(len)?.to_vec();
+                Some(Packet::WorldSync {
+                    level_hash,
+                    seq,
+                    payload,
+                })
+            }
+            TAG_WORLD_ACTION => Some(Packet::WorldAction {
+                player_id: r.u8()?,
+                kind: r.u8()?,
+                a: r.u32()?,
+                b: r.u8()?,
+            }),
+            TAG_LEVEL_TRANSITION_REQ => Some(Packet::LevelTransitionReq {
+                player_id: r.u8()?,
+                level: r.str()?,
+                clean: r.u8()? != 0,
+            }),
             _ => None,
         }
     }
@@ -525,6 +613,8 @@ mod tests {
                     yaw: 1.57,
                     flags: FLAG_GROUNDED | FLAG_SPEAKING,
                     anim_speed: 4.2,
+                    anim_clip_hash: 0x1234abcd,
+                    anim_time: 0.75,
                     level_hash: level_hash("Levels/GV_ZoneA_Start.level"),
                 }],
             },

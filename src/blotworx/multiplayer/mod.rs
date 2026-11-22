@@ -21,14 +21,14 @@ use net::{
     detect_lan_ip, spawn_public_ip_lookup, ClientEvent, HostServer, NetClient, RemoteMap,
     RemotePlayer,
 };
-use pants::{append_remote_player_draws, remote_player_matrix, PantsTextureCache};
+use pants::{append_remote_player_draws, PantsTextureCache};
 use protocol::{
     level_hash, pants_color, preferred_color_slot, sanitize_username, NetPlayerState,
-    DEFAULT_PORT, FLAG_GROUNDED, FLAG_JUMPING, FLAG_SPEAKING, FLAG_SPINNING, FLAG_SPRAY_PAINT,
-    FLAG_SPRAY_THINNER, MAX_PLAYERS, PANTS_PALETTE,
+    ACTION_LEVEL_READY, ACTION_PAINT_PIECE, DEFAULT_PORT, FLAG_GROUNDED, FLAG_JUMPING,
+    FLAG_SPEAKING, FLAG_SPINNING, FLAG_SPRAY_PAINT, FLAG_SPRAY_THINNER, MAX_PLAYERS, PANTS_PALETTE,
 };
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     sync::mpsc,
     time::{Duration, Instant},
 };
@@ -82,6 +82,14 @@ pub struct Multiplayer {
     last_tick: Instant,
 
     pants_cache: PantsTextureCache,
+    remote_ears: HashMap<u8, Option<super::ears::Pose>>,
+    last_world_sync_hash: u64,
+    last_world_sync_sent: Instant,
+    world_sync_seq: u32,
+    pending_world_sync: Option<(u32, u32, Vec<u8>)>,
+    pending_host_actions: Vec<(u8, u8, u32, u8)>,
+    pending_host_level_req: Option<(String, bool)>,
+    force_world_sync_now: bool,
     voice_settings: VoiceSettings,
     voice: VoiceEngine,
     discord: DiscordBridge,
@@ -137,6 +145,14 @@ impl Multiplayer {
             last_state_send: now,
             last_tick: now,
             pants_cache: PantsTextureCache::default(),
+            remote_ears: HashMap::new(),
+            last_world_sync_hash: 0,
+            last_world_sync_sent: now,
+            world_sync_seq: 0,
+            pending_world_sync: None,
+            pending_host_actions: Vec::new(),
+            pending_host_level_req: None,
+            force_world_sync_now: false,
             voice_settings,
             voice,
             discord,
@@ -160,6 +176,14 @@ impl Multiplayer {
 
     pub fn is_online(&self) -> bool {
         !matches!(self.state, ConnectionState::Offline)
+    }
+
+    pub fn is_host(&self) -> bool {
+        self.server.is_some()
+    }
+
+    pub fn is_client_only(&self) -> bool {
+        self.is_online() && self.server.is_none()
     }
 
     pub fn player_count(&self) -> usize {
@@ -204,11 +228,114 @@ impl Multiplayer {
     /// Call when a new level finishes loading so GPU texture caches stay fresh and the lobby knows our level.
     pub fn on_level_loaded(&mut self, level: &str) {
         self.pants_cache.clear();
+        self.remote_ears.clear();
+        self.last_world_sync_hash = 0;
         self.current_level = level.to_owned();
         if let Some(client) = &self.client {
             client.send_level(self.current_level.clone());
+            if self.is_client_only() {
+                client.send_world_action(ACTION_LEVEL_READY, level_hash(level), 0);
+            } else if self.is_host() {
+                self.force_world_sync_now = true;
+            }
         }
         self.sync_discord_presence();
+    }
+
+    /// Host-authoritative co-op progression: clients cannot break away from the host's level alone.
+    /// Returns `true` if the transition was forwarded to the host (client must wait for host to advance the party).
+    pub fn request_party_level_transition(&mut self, level: String, clean: bool) -> bool {
+        if self.is_client_only() {
+            if let Some(client) = &self.client {
+                client.send_level_transition_req(level.clone(), clean);
+                self.push_system_chat(format!(
+                    "Advancing party to {} (syncing with host)...",
+                    Self::pretty_level_name(&level)
+                ));
+            }
+            return true;
+        }
+        false
+    }
+
+    /// Synchronize authoritative world progression state (globals, quests, jigsaws, hidden/moved entities).
+    /// Host captures & broadcasts whenever anything changes (or on mid-level join); clients apply & forward paint hits.
+    pub fn sync_world(&mut self, world: &mut super::assets::World, player_pos: [f32; 3]) {
+        if !self.is_online() {
+            world.pending_mp_jigsaw_actions.clear();
+            return;
+        }
+        if self.is_host() {
+            // 1. Apply co-op actions received from clients (paint/thinner hits, mid-level join requests)
+            for (_pid, kind, a, b) in std::mem::take(&mut self.pending_host_actions) {
+                if kind == ACTION_PAINT_PIECE {
+                    if world.preview_jigsaw_contact(a as usize, b != 0).unwrap_or(false) {
+                        self.force_world_sync_now = true;
+                    }
+                } else if kind == ACTION_LEVEL_READY {
+                    self.force_world_sync_now = true;
+                }
+            }
+            // 2. Honor party-wide level transition requests from clients
+            if let Some((target_level, clean)) = self.pending_host_level_req.take() {
+                if !target_level.is_empty() && !target_level.eq_ignore_ascii_case(&world.report.level) {
+                    if clean {
+                        let _ = world.level_transition.request_clean(&target_level);
+                    } else {
+                        let _ = world.level_transition.request(&target_level);
+                    }
+                    self.push_system_chat(format!(
+                        "Party advancing to {}!",
+                        Self::pretty_level_name(&target_level)
+                    ));
+                }
+            }
+            // 3. Local host paint/thinner hits trigger immediate sync
+            if !world.pending_mp_jigsaw_actions.is_empty() {
+                world.pending_mp_jigsaw_actions.clear();
+                self.force_world_sync_now = true;
+            }
+            // 4. Periodically capture & broadcast compressed world state when changed (or forced)
+            let now = Instant::now();
+            if self.force_world_sync_now
+                || now.duration_since(self.last_world_sync_sent) >= Duration::from_millis(250)
+            {
+                self.last_world_sync_sent = now;
+                let snap = world.capture_mp_world_sync(player_pos);
+                let mut h: u64 = 0xcbf29ce484222325;
+                for &b in &snap {
+                    h ^= b as u64;
+                    h = h.wrapping_mul(0x100000001b3);
+                }
+                if h != self.last_world_sync_hash || self.force_world_sync_now {
+                    self.last_world_sync_hash = h;
+                    self.force_world_sync_now = false;
+                    self.world_sync_seq = self.world_sync_seq.wrapping_add(1).max(1);
+                    if let Some(client) = &self.client {
+                        client.send_world_sync(
+                            level_hash(&world.report.level),
+                            self.world_sync_seq,
+                            snap,
+                        );
+                    }
+                }
+            }
+        } else {
+            // Client: forward any local paint/thinner hits to the authoritative host
+            if let Some(client) = &self.client {
+                for (owner, painted) in std::mem::take(&mut world.pending_mp_jigsaw_actions) {
+                    client.send_world_action(ACTION_PAINT_PIECE, owner, u8::from(painted));
+                }
+            } else {
+                world.pending_mp_jigsaw_actions.clear();
+            }
+            // Client: apply latest authoritative world state snapshot from host
+            if let Some((lh, _seq, payload)) = self.pending_world_sync.take() {
+                if lh == level_hash(&world.report.level) {
+                    let _ = world.apply_mp_world_sync(&payload);
+                }
+            }
+        }
     }
 
     /// Optional level switch requested by clicking "Follow Host Level" in the lobby UI.
@@ -344,8 +471,13 @@ impl Multiplayer {
         self.server = None;
         self.local_id = None;
         self.remotes.clear();
+        self.remote_ears.clear();
         self.seen_chat_ids.clear();
         self.pending_discord_requests.clear();
+        self.pending_world_sync = None;
+        self.pending_host_actions.clear();
+        self.pending_host_level_req = None;
+        self.last_world_sync_hash = 0;
         self.state = ConnectionState::Offline;
         self.sync_discord_presence();
         if was_online {
@@ -431,6 +563,8 @@ impl Multiplayer {
         grounded: bool,
         spinning: bool,
         spraying_ink: Option<usize>,
+        anim_clip_hash: u32,
+        anim_time: f32,
         listener_pos: [f32; 3],
         listener_right: [f32; 3],
     ) {
@@ -528,7 +662,7 @@ impl Multiplayer {
                     self.local_id = Some(player_id);
                     self.local_color_slot = color_slot;
                     self.session_id = session_id;
-                    self.host_level = host_level;
+                    self.host_level = host_level.clone();
                     if let ConnectionState::Connecting(addr) = &self.state {
                         self.state = ConnectionState::Connected { addr: addr.clone() };
                     }
@@ -539,6 +673,24 @@ impl Multiplayer {
                         self.username
                     ));
                     self.set_notice(format!("Connected ({cname} pants)"));
+                    // Host is the rule: force client onto host's level or immediately request mid-level world sync
+                    if self.is_client_only() && !host_level.is_empty() {
+                        if !host_level.eq_ignore_ascii_case(&self.current_level) {
+                            self.push_system_chat(format!(
+                                "Syncing to host's level: {}...",
+                                Self::pretty_level_name(&host_level)
+                            ));
+                            self.pending_level_switch = Some(host_level);
+                        } else if let Some(client) = &self.client {
+                            client.send_world_action(
+                                ACTION_LEVEL_READY,
+                                level_hash(&self.current_level),
+                                0,
+                            );
+                        }
+                    } else if self.is_host() {
+                        self.force_world_sync_now = true;
+                    }
                     presence_dirty = true;
                 }
                 ClientEvent::Rejected(reason) => {
@@ -548,8 +700,24 @@ impl Multiplayer {
                     host_level,
                     players,
                 } => {
-                    self.host_level = host_level;
+                    let prev_count = self.remotes.len();
+                    self.host_level = host_level.clone();
                     self.apply_roster(players);
+                    if self.is_host() && self.remotes.len() > prev_count {
+                        self.force_world_sync_now = true;
+                    }
+                    // Host is the rule: whenever host advances to a new level, automatically pull all clients along
+                    if self.is_client_only()
+                        && !host_level.is_empty()
+                        && !host_level.eq_ignore_ascii_case(&self.current_level)
+                        && self.pending_level_switch.as_deref() != Some(host_level.as_str())
+                    {
+                        self.push_system_chat(format!(
+                            "Host moved to {} — syncing party...",
+                            Self::pretty_level_name(&host_level)
+                        ));
+                        self.pending_level_switch = Some(host_level);
+                    }
                     presence_dirty = true;
                 }
                 ClientEvent::Snapshot(states) => {
@@ -591,6 +759,34 @@ impl Multiplayer {
                         if let Some(rp) = self.remotes.get_mut(&sender_id) {
                             rp.last_voice_at = Some(now);
                         }
+                    }
+                }
+                ClientEvent::WorldSync {
+                    level_hash,
+                    seq,
+                    payload,
+                } => {
+                    if self.is_client_only() {
+                        self.pending_world_sync = Some((level_hash, seq, payload));
+                    }
+                }
+                ClientEvent::WorldAction {
+                    player_id,
+                    kind,
+                    a,
+                    b,
+                } => {
+                    if self.is_host() {
+                        self.pending_host_actions.push((player_id, kind, a, b));
+                    }
+                }
+                ClientEvent::LevelTransitionReq {
+                    player_id: _,
+                    level,
+                    clean,
+                } => {
+                    if self.is_host() {
+                        self.pending_host_level_req = Some((level, clean));
                     }
                 }
                 ClientEvent::Disconnected(reason) => {
@@ -648,6 +844,8 @@ impl Multiplayer {
                     yaw: player_yaw,
                     flags,
                     anim_speed: horiz_speed,
+                    anim_clip_hash,
+                    anim_time,
                     level_hash: lh,
                 });
             }
@@ -677,23 +875,26 @@ impl Multiplayer {
     }
 
     /// Apply the local player's unique pants color to Mickey's draws AND append all remote Mickeys
-    /// in the same level wearing their own unique pants colors.
+    /// in the same level — each independently animated, rotated, ear-billboarded to the local camera,
+    /// holding their own paintbrush, and wearing their own unique pants color.
     pub fn apply_player_draws(
         &mut self,
-        world: &super::assets::World,
+        world: &mut super::assets::World,
         draws: &mut Vec<GpuDrawCommand>,
+        ear_camera: super::ears::EarTransform,
+        view: &[f32; 16],
     ) {
         let online = self.is_online();
         if !online && self.chosen_color_slot.is_none() {
             return;
         }
         let local_color = self.local_color_slot();
-        // Snapshot the unmodified skinned Mickey draws before recoloring local Mickey
-        let base_mickey: Vec<GpuDrawCommand> = if online {
+        // Snapshot the SH-lit Mickey material templates before recoloring local Mickey's pants
+        let lit_player_templates: Vec<(usize, GpuDrawCommand)> = if online {
             world
                 .player_draws
                 .iter()
-                .filter_map(|&idx| draws.get(idx).cloned())
+                .filter_map(|&idx| draws.get(idx).cloned().map(|d| (idx, d)))
                 .collect()
         } else {
             Vec::new()
@@ -706,17 +907,13 @@ impl Multiplayer {
             }
         }
 
-        if !online || base_mickey.is_empty() {
+        if !online || lit_player_templates.is_empty() {
             return;
         }
         let my_level_hash = level_hash(&self.current_level);
-        let entity_template = &world.entities[world.player_entity];
-        let time_s = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs_f64())
-            .unwrap_or(0.0);
 
-        // Render every remote player currently in this level with their own unique pants color
+        // Render every remote player currently in this level with their OWN Havok animation,
+        // rotation, camera-facing Mickey ears, paintbrush, and unique pants color
         let mut remote_ids: Vec<u8> = self.remotes.keys().copied().collect();
         remote_ids.sort_unstable();
         for id in remote_ids {
@@ -726,18 +923,22 @@ impl Multiplayer {
             if !rp.has_state || rp.level_hash != my_level_hash {
                 continue;
             }
-            let mat = remote_player_matrix(
-                rp.render_pos,
-                rp.render_yaw,
-                rp.anim_speed,
-                rp.flags,
-                time_s,
-                entity_template,
-            );
+            let ear_entry = self.remote_ears.entry(id).or_insert(None);
+            let cam_copy = super::ears::EarTransform {
+                rotation: ear_camera.rotation,
+                position: ear_camera.position,
+            };
             append_remote_player_draws(
                 &mut self.pants_cache,
-                &base_mickey,
-                mat,
+                world,
+                &lit_player_templates,
+                ear_entry,
+                cam_copy,
+                view,
+                rp.render_pos,
+                rp.render_yaw,
+                rp.anim_clip_hash,
+                rp.render_anim_time,
                 rp.info.color_slot,
                 rp.flags,
                 draws,
@@ -1307,18 +1508,10 @@ impl Multiplayer {
                 if ui.button("Disconnect").clicked() {
                     self.disconnect();
                 }
-                if !self.host_level.is_empty()
-                    && !self.host_level.eq_ignore_ascii_case(&self.current_level)
-                {
-                    if ui
-                        .button(format!(
-                            "Warp to Host Level ({})",
-                            Self::pretty_level_name(&self.host_level)
-                        ))
-                        .clicked()
-                    {
-                        self.pending_level_switch = Some(self.host_level.clone());
-                    }
+                if self.is_host() {
+                    ui.weak("· Host Authoritative (All players sync to your world)");
+                } else if self.is_client_only() {
+                    ui.weak("· Synced to Host's World & Progression");
                 }
             });
         }

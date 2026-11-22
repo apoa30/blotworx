@@ -313,6 +313,72 @@ impl Resources {
             _ => unreachable!(),
         }
     }
+    /// Stable FNV-1a hash of a normalized clip name for compact multiplayer animation sync.
+    pub fn clip_name_hash(name: &str) -> u32 {
+        let mut h: u32 = 0x811c9dc5;
+        for b in key(name).bytes() {
+            h ^= b as u32;
+            h = h.wrapping_mul(0x01000193);
+        }
+        h
+    }
+    /// Extract the primary active Havok clip name hash and playback time from a live player graph.
+    pub fn active_clip_and_time(prepared: &super::generator_plan::Prepared) -> (u32, f32) {
+        let mut best: Option<(i32, &str, f32)> = None;
+        for node in &prepared.plan.nodes {
+            if let Some(definition) = prepared.state.clips.get(&node.object) {
+                if let Ok(instance) = prepared.clips.get(&node.object) {
+                    let t = if instance.clock.local_time.is_finite() {
+                        instance.clock.local_time.max(0.0)
+                    } else {
+                        0.0
+                    };
+                    let name = definition.settings.animation_name.as_str();
+                    let lower = name.to_ascii_lowercase();
+                    // Prefer primary full-body clips over partial upper-body/face/aim overlays
+                    let score = if lower.contains("aim")
+                        || lower.contains("additive")
+                        || lower.contains("face")
+                        || lower.contains("blink")
+                        || lower.contains("ear")
+                    {
+                        0
+                    } else {
+                        10
+                    };
+                    if best.is_none() || score > best.unwrap().0 {
+                        best = Some((score, name, t));
+                    }
+                }
+            }
+        }
+        if let Some((_, name, t)) = best {
+            (Self::clip_name_hash(name), t)
+        } else {
+            (0, 0.0)
+        }
+    }
+    /// Sample a player animation clip by its FNV-1a name hash at `time` (wrapped to clip duration).
+    /// Used to animate each remote multiplayer Mickey independently with real Havok clips.
+    pub fn sample_bones_by_hash(&mut self, name_hash: u32, time: f32) -> Option<Vec<HkxBone>> {
+        if name_hash == 0 {
+            return None;
+        }
+        let matched_name = self
+            .names
+            .keys()
+            .find(|name| Self::clip_name_hash(name) == name_hash)
+            .cloned()?;
+        let rig = self.rig.clone();
+        let clip = self.clip(&matched_name).ok()?;
+        let dur = clip.info.duration.max(0.001);
+        let t = if time.is_finite() {
+            time.rem_euclid(dur)
+        } else {
+            0.0
+        };
+        clip.sample_bones(&rig, t).ok()
+    }
     /// Lossless retained-payload accounting for the runtime memory report.
     /// Native Havok allocations owned by decoded clips are opaque because the
     /// native allocator does not expose their sizes.

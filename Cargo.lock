@@ -541,7 +541,7 @@ dependencies = [
 
 [[package]]
 name = "blotworx"
-version = "0.1.0-demo.10"
+version = "0.1.0-demo.11"
 dependencies = [
  "android-activity",
  "anyhow",

@@ -8,7 +8,7 @@
 
 use super::protocol::{
     level_hash, pants_color, preferred_color_slot, sanitize_username, ChatPacket, NetPlayerState,
-    Packet, PlayerInfo, MAX_PLAYERS,
+    Packet, PlayerInfo, ACTION_LEVEL_READY, MAX_PLAYERS,
 };
 use super::relay::{self, RelayConn};
 use anyhow::{bail, Context, Result};
@@ -292,7 +292,8 @@ fn server_loop(
     let mut next_msg_id: u32 = 1;
     let mut tick: u32 = 0;
     let mut last_snapshot = Instant::now();
-    let mut buf = [0u8; 2048];
+    let mut latest_world_sync: Option<(u32, u32, Vec<u8>)> = None;
+    let mut buf = vec![0u8; 65536];
 
     let build_roster = |slots: &[Option<ServerSlot>; MAX_PLAYERS]| -> Vec<PlayerInfo> {
         slots
@@ -399,6 +400,8 @@ fn server_loop(
                         yaw: 0.0,
                         flags: 0,
                         anim_speed: 0.0,
+                        anim_clip_hash: 0,
+                        anim_time: 0.0,
                         level_hash: level_hash(&player_level),
                     };
                     slots[free_id] = Some(ServerSlot {
@@ -422,6 +425,19 @@ fn server_loop(
                     // Replay recent chat messages to newly joined player
                     for msg in &chat_history {
                         transport.send_to(&from, &Packet::Chat(msg.clone()));
+                    }
+                    // Immediately send latest authoritative world state to mid-level joiner if same level
+                    if let Some((lh, sync_seq, ref payload)) = latest_world_sync {
+                        if lh == level_hash(&host_level) {
+                            transport.send_to(
+                                &from,
+                                &Packet::WorldSync {
+                                    level_hash: lh,
+                                    seq: sync_seq,
+                                    payload: payload.clone(),
+                                },
+                            );
+                        }
                     }
                     // Notify everyone of updated roster + system join message
                     transport.broadcast(
@@ -648,6 +664,101 @@ fn server_loop(
                     }
                 }
 
+                Packet::WorldSync {
+                    level_hash: lh,
+                    seq,
+                    payload,
+                } => {
+                    // Only host (slot 0) is authoritative for world state
+                    let is_host = slots[0].as_ref().is_some_and(|s| s.addr == from);
+                    if is_host {
+                        if let Some(slot) = &mut slots[0] {
+                            slot.last_seen = now;
+                        }
+                        latest_world_sync = Some((lh, seq, payload.clone()));
+                        transport.broadcast(
+                            &slots,
+                            &Packet::WorldSync {
+                                level_hash: lh,
+                                seq,
+                                payload,
+                            },
+                            Some(0),
+                        );
+                    }
+                }
+
+                Packet::WorldAction {
+                    player_id,
+                    kind,
+                    a,
+                    b,
+                } => {
+                    let valid = slots
+                        .get(player_id as usize)
+                        .and_then(|s| s.as_ref())
+                        .is_some_and(|s| s.addr == from);
+                    if !valid {
+                        continue;
+                    }
+                    if let Some(Some(slot)) = slots.get_mut(player_id as usize) {
+                        slot.last_seen = now;
+                    }
+                    if kind == ACTION_LEVEL_READY {
+                        if let Some((lh, sync_seq, ref payload)) = latest_world_sync {
+                            if lh == a {
+                                transport.send_to(
+                                    &from,
+                                    &Packet::WorldSync {
+                                        level_hash: lh,
+                                        seq: sync_seq,
+                                        payload: payload.clone(),
+                                    },
+                                );
+                            }
+                        }
+                    }
+                    // Forward co-op action to host (slot 0)
+                    if let Some(host_addr) = slots[0].as_ref().map(|s| s.addr.clone()) {
+                        transport.send_to(
+                            &host_addr,
+                            &Packet::WorldAction {
+                                player_id,
+                                kind,
+                                a,
+                                b,
+                            },
+                        );
+                    }
+                }
+
+                Packet::LevelTransitionReq {
+                    player_id,
+                    level,
+                    clean,
+                } => {
+                    let valid = slots
+                        .get(player_id as usize)
+                        .and_then(|s| s.as_ref())
+                        .is_some_and(|s| s.addr == from);
+                    if !valid {
+                        continue;
+                    }
+                    if let Some(Some(slot)) = slots.get_mut(player_id as usize) {
+                        slot.last_seen = now;
+                    }
+                    if let Some(host_addr) = slots[0].as_ref().map(|s| s.addr.clone()) {
+                        transport.send_to(
+                            &host_addr,
+                            &Packet::LevelTransitionReq {
+                                player_id,
+                                level,
+                                clean,
+                            },
+                        );
+                    }
+                }
+
                 Packet::Heartbeat { player_id } => {
                     if let Some(Some(slot)) = slots.get_mut(player_id as usize) {
                         if slot.addr == from {
@@ -782,6 +893,20 @@ pub enum ClientCmd {
     },
     SendLevel(String),
     SendColor(u8),
+    SendWorldSync {
+        level_hash: u32,
+        seq: u32,
+        payload: Vec<u8>,
+    },
+    SendWorldAction {
+        kind: u8,
+        a: u32,
+        b: u8,
+    },
+    SendLevelTransitionReq {
+        level: String,
+        clean: bool,
+    },
     Disconnect,
 }
 
@@ -805,6 +930,22 @@ pub enum ClientEvent {
         pos: [f32; 3],
         level_hash: u32,
         ulaw: Vec<u8>,
+    },
+    WorldSync {
+        level_hash: u32,
+        seq: u32,
+        payload: Vec<u8>,
+    },
+    WorldAction {
+        player_id: u8,
+        kind: u8,
+        a: u32,
+        b: u8,
+    },
+    LevelTransitionReq {
+        player_id: u8,
+        level: String,
+        clean: bool,
     },
     Disconnected(String),
 }
@@ -903,6 +1044,24 @@ impl NetClient {
         let _ = self.tx.send(ClientCmd::SendColor(color_slot));
     }
 
+    pub fn send_world_sync(&self, level_hash: u32, seq: u32, payload: Vec<u8>) {
+        let _ = self.tx.send(ClientCmd::SendWorldSync {
+            level_hash,
+            seq,
+            payload,
+        });
+    }
+
+    pub fn send_world_action(&self, kind: u8, a: u32, b: u8) {
+        let _ = self.tx.send(ClientCmd::SendWorldAction { kind, a, b });
+    }
+
+    pub fn send_level_transition_req(&self, level: String, clean: bool) {
+        let _ = self
+            .tx
+            .send(ClientCmd::SendLevelTransitionReq { level, clean });
+    }
+
     pub fn poll_events(&self) -> Vec<ClientEvent> {
         let mut out = Vec::new();
         while let Ok(ev) = self.rx.try_recv() {
@@ -946,7 +1105,7 @@ fn client_loop(
     let mut join_attempts = 1u32;
     let mut last_rx = Instant::now();
     let mut last_hb = Instant::now();
-    let mut buf = [0u8; 2048];
+    let mut buf = vec![0u8; 65536];
 
     loop {
         // Process outbound commands
@@ -1024,6 +1183,44 @@ fn client_loop(
                         let _ = transport.send(&bytes);
                     }
                 }
+                ClientCmd::SendWorldSync {
+                    level_hash,
+                    seq,
+                    payload,
+                } => {
+                    if player_id == Some(0) {
+                        let bytes = Packet::WorldSync {
+                            level_hash,
+                            seq,
+                            payload,
+                        }
+                        .encode();
+                        let _ = transport.send(&bytes);
+                    }
+                }
+                ClientCmd::SendWorldAction { kind, a, b } => {
+                    if let Some(id) = player_id {
+                        let bytes = Packet::WorldAction {
+                            player_id: id,
+                            kind,
+                            a,
+                            b,
+                        }
+                        .encode();
+                        let _ = transport.send(&bytes);
+                    }
+                }
+                ClientCmd::SendLevelTransitionReq { level, clean } => {
+                    if let Some(id) = player_id {
+                        let bytes = Packet::LevelTransitionReq {
+                            player_id: id,
+                            level,
+                            clean,
+                        }
+                        .encode();
+                        let _ = transport.send(&bytes);
+                    }
+                }
             }
         }
 
@@ -1096,6 +1293,41 @@ fn client_loop(
                         pos,
                         level_hash,
                         ulaw,
+                    });
+                }
+                Packet::WorldSync {
+                    level_hash,
+                    seq,
+                    payload,
+                } => {
+                    let _ = ev_tx.send(ClientEvent::WorldSync {
+                        level_hash,
+                        seq,
+                        payload,
+                    });
+                }
+                Packet::WorldAction {
+                    player_id,
+                    kind,
+                    a,
+                    b,
+                } => {
+                    let _ = ev_tx.send(ClientEvent::WorldAction {
+                        player_id,
+                        kind,
+                        a,
+                        b,
+                    });
+                }
+                Packet::LevelTransitionReq {
+                    player_id,
+                    level,
+                    clean,
+                } => {
+                    let _ = ev_tx.send(ClientEvent::LevelTransitionReq {
+                        player_id,
+                        level,
+                        clean,
                     });
                 }
                 _ => {}
@@ -1186,6 +1418,9 @@ pub struct RemotePlayer {
     pub render_yaw: f32,
     pub flags: u8,
     pub anim_speed: f32,
+    pub anim_clip_hash: u32,
+    pub target_anim_time: f32,
+    pub render_anim_time: f32,
     pub level_hash: u32,
     pub last_voice_at: Option<Instant>,
     pub muted: bool,
@@ -1204,6 +1439,9 @@ impl RemotePlayer {
             render_yaw: 0.0,
             flags: 0,
             anim_speed: 0.0,
+            anim_clip_hash: 0,
+            target_anim_time: 0.0,
+            render_anim_time: 0.0,
             level_hash: lh,
             last_voice_at: None,
             muted: false,
@@ -1218,10 +1456,16 @@ impl RemotePlayer {
         self.target_yaw = s.yaw;
         self.flags = s.flags;
         self.anim_speed = s.anim_speed;
+        if s.anim_clip_hash != self.anim_clip_hash {
+            self.anim_clip_hash = s.anim_clip_hash;
+            self.render_anim_time = s.anim_time;
+        }
+        self.target_anim_time = s.anim_time;
         self.level_hash = s.level_hash;
         if !self.has_state {
             self.render_pos = s.pos;
             self.render_yaw = s.yaw;
+            self.render_anim_time = s.anim_time;
             self.has_state = true;
         } else {
             // Snap if teleported > 12m (e.g. respawn or checkpoint warp)
@@ -1252,6 +1496,14 @@ impl RemotePlayer {
             dyaw += std::f32::consts::TAU;
         }
         self.render_yaw += dyaw * alpha;
+        // Advance remote animation clock smoothly and gently correct drift
+        self.render_anim_time += dt;
+        let dt_err = self.target_anim_time - self.render_anim_time;
+        if dt_err.abs() > 0.35 {
+            self.render_anim_time = self.target_anim_time;
+        } else {
+            self.render_anim_time += dt_err * (dt * 6.0).clamp(0.0, 1.0);
+        }
     }
 
     pub fn is_speaking(&self, now: Instant) -> bool {

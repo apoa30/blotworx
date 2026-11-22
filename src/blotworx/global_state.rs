@@ -98,6 +98,28 @@ impl State {
             .get(&name_key(name))
             .map(|&id| self.authored[id as usize].0)
     }
+    /// Return every global slot whose live value differs from its authored initial value.
+    pub fn diff_from_authored(&self) -> Vec<(u16, i16)> {
+        self.values
+            .iter()
+            .zip(&self.authored)
+            .enumerate()
+            .filter_map(|(idx, (&val, &(init, _)))| {
+                (val != init && idx <= u16::MAX as usize).then_some((idx as u16, val))
+            })
+            .collect()
+    }
+    /// Apply authoritative host global diffs onto this client's global state.
+    pub fn apply_network_sync(&mut self, diffs: &[(u16, i16)]) {
+        for (val, &(init, _)) in self.values.iter_mut().zip(&self.authored) {
+            *val = init;
+        }
+        for &(id, val) in diffs {
+            if let Some(slot) = self.values.get_mut(id as usize) {
+                *slot = val;
+            }
+        }
+    }
     /// GLOB v1, REL209850..2099ec: signed halfword, persistence byte,
     /// unused padding byte. Named records have native four-byte alignment.
     pub fn save_payload(&self) -> Result<Vec<u8>> {

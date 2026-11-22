@@ -6,7 +6,8 @@
 //! unique pants color for each of the 16 players (cached per `(source_ptr, color_slot)` so OpenGL
 //! uploads each color once with zero per-frame allocation).
 
-use super::protocol::{pants_color, FLAG_JUMPING, FLAG_SPINNING, FLAG_SPRAY_PAINT, FLAG_SPRAY_THINNER};
+use super::protocol::{pants_color, FLAG_SPRAY_PAINT, FLAG_SPRAY_THINNER};
+use crate::blotworx::{assets::World, ears, skin};
 use crate::render_support::{material_preview::MaterialImage, viewport3d::GpuDrawCommand};
 use std::{collections::HashMap, sync::Arc};
 
@@ -130,60 +131,105 @@ pub fn recolor_mickey_shorts_rgba(src: &[u8], target_rgb: [u8; 3]) -> Vec<u8> {
     dst
 }
 
-/// Build a remote player's column-major 4x4 transform matrix from interpolated pose + motion flags.
-pub fn remote_player_matrix(
-    pos: [f32; 3],
-    yaw: f32,
-    anim_speed: f32,
-    flags: u8,
-    time_s: f64,
-    entity_template: &crate::blotworx::assets::RuntimeEntity,
-) -> [f32; 16] {
-    let spin_offset = if (flags & FLAG_SPINNING) != 0 {
-        (time_s * 18.0) as f32
-    } else {
-        0.0
-    };
-    let bob_y = if (flags & FLAG_JUMPING) != 0 {
-        0.06
-    } else if anim_speed > 0.35 {
-        let freq = (anim_speed * 2.4).clamp(6.0, 14.0);
-        ((time_s as f32 * freq).sin().abs()) * 0.09
-    } else {
-        (time_s as f32 * 2.2).sin() * 0.015
-    };
-    let mut mat = entity_template.controller_matrix(
-        [pos[0], pos[1] + bob_y, pos[2]],
-        yaw + spin_offset,
-    );
-    // Subtle paint/thinner action lean when spraying
-    if (flags & (FLAG_SPRAY_PAINT | FLAG_SPRAY_THINNER)) != 0 {
-        mat[13] += 0.02;
-    }
-    mat
-}
-
-/// Append a remote player's Mickey mesh draws (with their unique pants color) onto `draws`.
+/// Append a remote player's independently animated, rotated, camera-ear-billboarded Mickey mesh
+/// (with their unique pants color and paintbrush) onto `out_draws`.
+#[allow(clippy::too_many_arguments)]
 pub fn append_remote_player_draws(
     cache: &mut PantsTextureCache,
-    base_player_draws: &[GpuDrawCommand],
-    remote_matrix: [f32; 16],
+    world: &mut World,
+    lit_player_templates: &[(usize, GpuDrawCommand)],
+    ear_pose: &mut Option<ears::Pose>,
+    ear_camera: ears::EarTransform,
+    view: &[f32; 16],
+    pos: [f32; 3],
+    yaw: f32,
+    anim_clip_hash: u32,
+    anim_time: f32,
     color_slot: u8,
     flags: u8,
     out_draws: &mut Vec<GpuDrawCommand>,
 ) {
-    for base in base_player_draws {
+    let actor_matrix = world.entities[world.player_entity].controller_matrix(pos, yaw);
+
+    // 1. Sample THIS remote player's own Havok animation clip independently of the local player
+    let remote_bones = world
+        .player_animations
+        .sample_bones_by_hash(anim_clip_hash, anim_time)
+        .unwrap_or_else(|| world.player_animations.rig.bones.clone());
+
+    // 2. Update THIS remote player's Mickey ears so they authentically face the local viewer's camera
+    if ear_pose.is_none() {
+        *ear_pose = ears::Pose::new(&world.player_animations.rig.bones).ok();
+    }
+    if let (Some(ears), Some(ear_settings)) =
+        (ear_pose.as_mut(), world.report.ear_settings.as_ref())
+    {
+        let _ = ears.update(ear_settings, &remote_bones, actor_matrix, ear_camera);
+    }
+    let ear_overrides = ear_pose.as_ref().map_or(&[][..], |e| e.overrides.as_slice());
+    let model_pose = skin::model_pose(&remote_bones, ear_overrides).ok();
+
+    // 3. Clone SH-lit material templates, then skin fresh from UNMODIFIED rest-pose `world.draws`
+    let start_idx = out_draws.len();
+    let mut draw_slot_by_orig: HashMap<usize, usize> = HashMap::with_capacity(lit_player_templates.len());
+    for (orig_idx, base) in lit_player_templates {
         let mut d = base.clone();
-        d.trans_mat = remote_matrix;
+        d.trans_mat = actor_matrix;
         cache.apply_to_draw(&mut d, color_slot);
-        // Subtle glow tint if actively spraying Paint or Thinner
         if (flags & FLAG_SPRAY_PAINT) != 0 {
             d.color = [0.92, 0.97, 1.0, 1.0];
         } else if (flags & FLAG_SPRAY_THINNER) != 0 {
             d.color = [0.92, 1.0, 0.92, 1.0];
         }
+        let dst_idx = out_draws.len();
+        draw_slot_by_orig.insert(*orig_idx, dst_idx);
         out_draws.push(d);
     }
+
+    if let Some(ref pose) = model_pose {
+        for mesh in &world.player_meshes {
+            let Some(&dst_idx) = draw_slot_by_orig.get(&mesh.draw) else {
+                continue;
+            };
+            let Some(rest_draw) = world.draws.get(mesh.draw) else {
+                continue;
+            };
+            let Some(skin_data) = world
+                .skins
+                .get(&mesh.asset)
+                .and_then(|s| s.iter().find(|s| s.block == mesh.block))
+            else {
+                continue;
+            };
+            if let Ok(palette) = skin::palette_from_model_pose(skin_data, pose) {
+                if let Ok((verts, aabb_min, aabb_max)) = skin::render_skinned_pose(
+                    skin_data,
+                    &palette,
+                    &rest_draw.v_data,
+                    &mesh.positions,
+                    &mesh.normals,
+                    &mesh.sources,
+                    mesh.transform,
+                ) {
+                    let dst = &mut out_draws[dst_idx];
+                    dst.v_data = Arc::new(verts);
+                    dst.aabb_min = aabb_min;
+                    dst.aabb_max = aabb_max;
+                }
+            }
+        }
+
+        // 4. Append remote player's paintbrush locked to their animated hand bone
+        let brush_start = out_draws.len();
+        if world.brush.append(pose, actor_matrix, out_draws).is_ok() {
+            let _ = world.brush.apply_lighting(
+                &mut out_draws[brush_start..],
+                view,
+                &world.report.spherical_lights,
+            );
+        }
+    }
+    let _ = start_idx;
 }
 
 #[cfg(test)]

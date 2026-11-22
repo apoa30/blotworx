@@ -4251,7 +4251,39 @@ impl Engine {
                 self.render_probe_done = true;
             }
         }
-        self.multiplayer.apply_player_draws(world, &mut draws);
+        let mp_ear_camera = authored_camera
+            .map(|frame| frame.ear_camera())
+            .unwrap_or_else(|| {
+                let (sy, cy) = self.camera.yaw.sin_cos();
+                let (sp, cp) = self.camera.pitch.sin_cos();
+                let dir = [cy * cp, sp, sy * cp];
+                ears::EarTransform {
+                    rotation: [[-sy, -cy * sp, -cy * cp], [0., cp, -sp], [cy, -sy * sp, -sy * cp]],
+                    position: std::array::from_fn(|i| {
+                        self.camera.camera_target[i] + dir[i] * self.camera.distance
+                    }),
+                }
+            });
+        let mp_view = self
+            .camera
+            .camera_override
+            .as_ref()
+            .map(|camera| camera.view)
+            .unwrap_or_else(|| {
+                let (sy, cy) = self.camera.yaw.sin_cos();
+                let (sp, cp) = self.camera.pitch.sin_cos();
+                let eye = add(
+                    self.camera.camera_target,
+                    [
+                        self.camera.distance * cy * cp,
+                        self.camera.distance * sp,
+                        self.camera.distance * sy * cp,
+                    ],
+                );
+                viewport3d::look_at_matrix(eye, self.camera.camera_target, [0., 1., 0.])
+            });
+        self.multiplayer
+            .apply_player_draws(world, &mut draws, mp_ear_camera, &mp_view);
         let mut draw_index = 0usize;
         draws.retain(|draw| {
             let visible = !world.hidden_jigsaw_draws.contains(&draw_index)
@@ -4493,6 +4525,8 @@ impl Engine {
             let p_grounded = player.grounded;
             let p_spinning = self.spin_preview_pending
                 || world.spin_ribbon.is_some();
+            let (anim_clip_hash, anim_time) =
+                animation_resources::Resources::active_clip_and_time(&world.player_graph);
             self.multiplayer.tick(
                 ui.ctx(),
                 &level_name,
@@ -4502,9 +4536,12 @@ impl Engine {
                 p_grounded,
                 p_spinning,
                 requested_hose,
+                anim_clip_hash,
+                anim_time,
                 eye,
                 billboard_right,
             );
+            self.multiplayer.sync_world(world, position);
             self.multiplayer
                 .draw_overlays(ui, rect, &view_projection, position);
             if let Some(target_level) = self.multiplayer.take_requested_level_switch() {
@@ -5243,16 +5280,18 @@ impl eframe::App for Engine {
                 }
             }
             if let Some((level, clean)) = self.world.as_mut().and_then(|world| world.level_transition.take()) {
-                self.level = level;
-                self.actor_focus = None;
-                self.preview_entry = None;
-                let mode = if clean { LevelLoad::Clean } else { LevelLoad::Transfer };
-                self.load_with_checkpoint(ui.ctx(), None, mode);
-                if self.receiver.is_some() {
-                    self.paint_loading_screen(ui);
+                if !self.multiplayer.request_party_level_transition(level.clone(), clean) {
+                    self.level = level;
+                    self.actor_focus = None;
+                    self.preview_entry = None;
+                    let mode = if clean { LevelLoad::Clean } else { LevelLoad::Transfer };
+                    self.load_with_checkpoint(ui.ctx(), None, mode);
+                    if self.receiver.is_some() {
+                        self.paint_loading_screen(ui);
+                    }
+                    ui.ctx().request_repaint();
+                    return;
                 }
-                ui.ctx().request_repaint();
-                return;
             }
         }
         // Exercise the interactive replacement path, including an existing

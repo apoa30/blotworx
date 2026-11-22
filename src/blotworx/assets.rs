@@ -530,6 +530,7 @@ pub struct World {
     pub collision: Collision,
     pub lights: Vec<GpuLight>,
     pub(super) enhanced_light_registry: super::scene_light_registry::Registry,
+    pub pending_mp_jigsaw_actions: Vec<(u32, bool)>,
     pub report: Report,
 }
 /// Resolved authored state retained for gameplay. Scene-local IDs must never
@@ -2587,7 +2588,14 @@ impl World {
     pub fn dispatch_brush_contact(&mut self, contact: &super::brush_preview::Contact,
         player_position: [f32;3]) -> Result<bool> {
         self.dispatch_projectile_game_events(contact)?;
-        self.brush_jigsaw_hit(&contact.hit, contact.ink==super::brush::Ink::Paint, player_position)
+        let painted = contact.ink == super::brush::Ink::Paint;
+        let changed = self.brush_jigsaw_hit(&contact.hit, painted, player_position)?;
+        if changed {
+            if let Ok(owner) = u32::try_from(contact.hit.owner) {
+                self.pending_mp_jigsaw_actions.push((owner, painted));
+            }
+        }
+        Ok(changed)
     }
     pub fn dispatch_projectile_game_events(
         &mut self,
@@ -8289,6 +8297,265 @@ impl World {
         Ok(true)
     }
 
+    /// Capture a compact zlib-compressed snapshot of all authoritative level progression state
+    /// (globals, quests, painted/thinned jigsaw pieces, hidden entities, and moved doors/platforms)
+    /// so mid-level joiners and connected clients stay 100% synced with the host.
+    pub fn capture_mp_world_sync(&self, host_pos: [f32; 3]) -> Vec<u8> {
+        use std::io::Write;
+        let mut raw = Vec::with_capacity(2048);
+        // Header magic + version
+        raw.extend_from_slice(b"BWS1");
+        for f in host_pos {
+            raw.extend_from_slice(&f.to_le_bytes());
+        }
+
+        // 1. Modified Apprentice globals
+        let globals = self.globals.diff_from_authored();
+        raw.extend_from_slice(&(globals.len().min(u16::MAX as usize) as u16).to_le_bytes());
+        for (id, val) in globals.into_iter().take(u16::MAX as usize) {
+            raw.extend_from_slice(&id.to_le_bytes());
+            raw.extend_from_slice(&val.to_le_bytes());
+        }
+
+        // 2. Active Quest slots
+        let quests: Vec<(u16, u16, u8)> = self
+            .quests
+            .slots
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, slot)| {
+                ((slot.current != u16::MAX || slot.status != 0) && idx <= u16::MAX as usize)
+                    .then_some((idx as u16, slot.current, slot.status))
+            })
+            .collect();
+        raw.extend_from_slice(&(quests.len().min(u16::MAX as usize) as u16).to_le_bytes());
+        for (idx, current, status) in quests.into_iter().take(u16::MAX as usize) {
+            raw.extend_from_slice(&idx.to_le_bytes());
+            raw.extend_from_slice(&current.to_le_bytes());
+            raw.push(status);
+        }
+
+        // 3. All Jigsaw paint/thinner piece states (sorted for deterministic hashing)
+        let mut jigsaws: Vec<(u32, u8)> = self
+            .jigsaw_owners
+            .iter()
+            .filter_map(|(&owner, source)| {
+                let inst = self.jigsaw_instances.get(source.instance)?;
+                let ent = self.entities.get(inst.entity)?;
+                let painted = *ent.jigsaw_states.get(inst.node)?.painted.get(source.piece)?;
+                Some((owner as u32, u8::from(painted)))
+            })
+            .collect();
+        jigsaws.sort_unstable_by_key(|&(o, _)| o);
+        raw.extend_from_slice(&(jigsaws.len().min(u32::MAX as usize) as u32).to_le_bytes());
+        for (owner, painted) in jigsaws {
+            raw.extend_from_slice(&owner.to_le_bytes());
+            raw.push(painted);
+        }
+
+        // 4. Hidden entities (excluding player_entity, sorted)
+        let mut hidden: Vec<u32> = self
+            .hidden_entities
+            .iter()
+            .copied()
+            .filter(|&e| e != self.player_entity && e < self.entities.len())
+            .map(|e| e as u32)
+            .collect();
+        hidden.sort_unstable();
+        raw.extend_from_slice(&(hidden.len() as u32).to_le_bytes());
+        for e in hidden {
+            raw.extend_from_slice(&e.to_le_bytes());
+        }
+
+        // 5. Moved entities (doors, bridges, switches, gears, platforms, enemies)
+        let mut moved: Vec<(u32, [f32; 3], [f32; 9])> = Vec::new();
+        for (idx, ent) in self.entities.iter().enumerate() {
+            if idx == self.player_entity
+                || self.hidden_entities.contains(&idx)
+                || self.removed_entities.contains(&idx)
+            {
+                continue;
+            }
+            let diff = ent
+                .transform
+                .iter()
+                .zip(&ent.authored_transform)
+                .any(|(a, b)| (a - b).abs() > 0.005);
+            if diff {
+                let pos = [ent.transform[12], ent.transform[13], ent.transform[14]];
+                moved.push((idx as u32, pos, ent.runtime_rotation));
+                if moved.len() >= 512 {
+                    break;
+                }
+            }
+        }
+        raw.extend_from_slice(&(moved.len() as u16).to_le_bytes());
+        for (idx, pos, rot) in moved {
+            raw.extend_from_slice(&idx.to_le_bytes());
+            for f in pos {
+                raw.extend_from_slice(&f.to_le_bytes());
+            }
+            for f in rot {
+                raw.extend_from_slice(&f.to_le_bytes());
+            }
+        }
+
+        let mut encoder =
+            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+        if encoder.write_all(&raw).is_ok() {
+            if let Ok(compressed) = encoder.finish() {
+                return compressed;
+            }
+        }
+        raw
+    }
+
+    /// Apply an authoritative host world state snapshot onto this client's `World`.
+    /// Returns `Some(host_pos)` if successfully applied.
+    pub fn apply_mp_world_sync(&mut self, compressed: &[u8]) -> Option<[f32; 3]> {
+        use std::io::Read;
+        let mut raw = Vec::new();
+        let mut decoder = flate2::read::ZlibDecoder::new(compressed);
+        if decoder.read_to_end(&mut raw).is_err() || raw.len() < 16 || &raw[..4] != b"BWS1" {
+            return None;
+        }
+        let mut pos = 4usize;
+        fn take<'a>(raw: &'a [u8], pos: &mut usize, n: usize) -> Option<&'a [u8]> {
+            let end = pos.checked_add(n)?;
+            let s = raw.get(*pos..end)?;
+            *pos = end;
+            Some(s)
+        }
+        let read_u8 = |raw: &[u8], pos: &mut usize| -> Option<u8> { Some(take(raw, pos, 1)?[0]) };
+        let read_u16 = |raw: &[u8], pos: &mut usize| -> Option<u16> {
+            Some(u16::from_le_bytes(take(raw, pos, 2)?.try_into().ok()?))
+        };
+        let read_i16 = |raw: &[u8], pos: &mut usize| -> Option<i16> {
+            Some(i16::from_le_bytes(take(raw, pos, 2)?.try_into().ok()?))
+        };
+        let read_u32 = |raw: &[u8], pos: &mut usize| -> Option<u32> {
+            Some(u32::from_le_bytes(take(raw, pos, 4)?.try_into().ok()?))
+        };
+        let read_f32 = |raw: &[u8], pos: &mut usize| -> Option<f32> {
+            let v = f32::from_le_bytes(take(raw, pos, 4)?.try_into().ok()?);
+            v.is_finite().then_some(v)
+        };
+
+        let host_pos = [
+            read_f32(&raw, &mut pos)?,
+            read_f32(&raw, &mut pos)?,
+            read_f32(&raw, &mut pos)?,
+        ];
+
+        // 1. Globals
+        let g_count = read_u16(&raw, &mut pos)? as usize;
+        let mut g_diffs = Vec::with_capacity(g_count);
+        for _ in 0..g_count {
+            let id = read_u16(&raw, &mut pos)?;
+            let val = read_i16(&raw, &mut pos)?;
+            g_diffs.push((id, val));
+        }
+        self.globals.apply_network_sync(&g_diffs);
+
+        // 2. Quests
+        let q_count = read_u16(&raw, &mut pos)? as usize;
+        for _ in 0..q_count {
+            let idx = read_u16(&raw, &mut pos)? as usize;
+            let current = read_u16(&raw, &mut pos)?;
+            let status = read_u8(&raw, &mut pos)?;
+            if let Some(slot) = self.quests.slots.get_mut(idx) {
+                slot.current = current;
+                slot.status = status;
+            }
+        }
+
+        // 3. Jigsaws (paint/thinner state + collision + visuals)
+        let j_count = read_u32(&raw, &mut pos)? as usize;
+        for _ in 0..j_count {
+            let owner = read_u32(&raw, &mut pos)? as usize;
+            let painted = read_u8(&raw, &mut pos)? != 0;
+            let _ = self.preview_jigsaw_contact(owner, painted);
+        }
+
+        // 4. Hidden entities (sync both newly hidden and unhidden entities)
+        let h_count = read_u32(&raw, &mut pos)? as usize;
+        let mut host_hidden = HashSet::with_capacity(h_count);
+        for _ in 0..h_count {
+            host_hidden.insert(read_u32(&raw, &mut pos)? as usize);
+        }
+        let to_hide: Vec<usize> = host_hidden
+            .iter()
+            .copied()
+            .filter(|&e| {
+                e != self.player_entity
+                    && e < self.entities.len()
+                    && !self.removed_entities.contains(&e)
+                    && !self.hidden_entities.contains(&e)
+            })
+            .collect();
+        let to_show: Vec<usize> = self
+            .hidden_entities
+            .iter()
+            .copied()
+            .filter(|&e| {
+                e != self.player_entity
+                    && e < self.entities.len()
+                    && !self.removed_entities.contains(&e)
+                    && !host_hidden.contains(&e)
+            })
+            .collect();
+        if !to_hide.is_empty() {
+            let _ = self.set_entities_hidden(&to_hide, true);
+        }
+        if !to_show.is_empty() {
+            let _ = self.set_entities_hidden(&to_show, false);
+        }
+
+        // 5. Moved entities (doors, bridges, switches, gears, platforms)
+        let m_count = read_u16(&raw, &mut pos)? as usize;
+        for _ in 0..m_count {
+            let idx = read_u32(&raw, &mut pos)? as usize;
+            let e_pos = [
+                read_f32(&raw, &mut pos)?,
+                read_f32(&raw, &mut pos)?,
+                read_f32(&raw, &mut pos)?,
+            ];
+            let mut rot = [0.0f32; 9];
+            for r in &mut rot {
+                *r = read_f32(&raw, &mut pos)?;
+            }
+            if idx == self.player_entity
+                || idx >= self.entities.len()
+                || self.removed_entities.contains(&idx)
+            {
+                continue;
+            }
+            if self.relocate_entity(idx, e_pos, rot).is_err() {
+                // Fallback for parented/dynamic entities: update visual transform directly
+                let ent = &mut self.entities[idx];
+                let scale = ent.authored_scale;
+                let mut mat = ent.transform;
+                for col in 0..3 {
+                    for row in 0..3 {
+                        mat[col * 4 + row] = rot[col * 3 + row] * scale;
+                    }
+                }
+                mat[12] = e_pos[0];
+                mat[13] = e_pos[1];
+                mat[14] = e_pos[2];
+                ent.transform = mat;
+                ent.runtime_rotation = rot;
+                for d in ent.draws.clone() {
+                    if let Some(draw) = self.draws.get_mut(d) {
+                        draw.trans_mat = mat;
+                    }
+                }
+            }
+        }
+
+        Some(host_pos)
+    }
+
     pub(super) fn imported_static_part(&self, owner: usize) -> Option<&CollisionPart> {
         let part = self
             .report
@@ -10334,6 +10601,7 @@ pub(super) fn load_with_bootstrap_mode(
         collision,
         lights,
         enhanced_light_registry: Default::default(),
+        pending_mp_jigsaw_actions: Vec::new(),
         model_bounds,
         report,
     };
