@@ -272,10 +272,14 @@ struct Mixer { tx: mpsc::Sender<Cmd>, clock: Arc<AtomicU64>, finished: Arc<Mutex
 impl Mixer {
     fn start() -> Result<Self> {
         let (tx, rx) = mpsc::channel::<Cmd>();
+        let (ready_tx, ready_rx) = mpsc::channel::<Result<()>>();
         let clock = Arc::new(AtomicU64::new(0)); let finished = Arc::new(Mutex::new(Vec::new()));
         let (c, f) = (clock.clone(), finished.clone());
-        let endpoint = super::audio_output::endpoint::Endpoint::open()?;
         std::thread::Builder::new().name("em2-audio-mixer".into()).spawn(move || {
+            let endpoint = match super::audio_output::endpoint::Endpoint::open() {
+                Ok(ep) => { let _ = ready_tx.send(Ok(())); ep }
+                Err(e) => { let _ = ready_tx.send(Err(e)); return; }
+            };
             const BLOCK: usize = 480; // 10 ms
             let mut voices: Vec<MixVoice> = Vec::new(); let mut queued: VecDeque<super::audio_output::endpoint::Buffer> = VecDeque::new();
             let mut mix = vec![0f32; BLOCK * 2];
@@ -326,6 +330,7 @@ impl Mixer {
                 c.fetch_add(BLOCK as u64, Ordering::AcqRel);
             }
         })?;
+        ready_rx.recv().map_err(|_| anyhow::anyhow!("EM2 audio mixer thread exited during open"))??;
         Ok(Self { tx, clock, finished })
     }
 }
