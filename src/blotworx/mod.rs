@@ -3230,10 +3230,10 @@ impl Engine {
             }
         }
         let focused = ui.input(|i| i.focused);
-        // Explicit capture sessions advance without OS focus and ignore devices.
+        // Gameplay continues running even when the window is unfocused (e.g. multiplayer / alt-tab);
+        // live keyboard/gamepad input remains gated on `focused`.
         let capture_mode = self.capture.is_some();
-        let active = (focused || capture_mode)
-            && !self.paused
+        let active = !self.paused
             && self.pause_menu_opened.is_none()
             && (!self.options_open || capture_mode)
             && !self.capture_requested
@@ -3257,7 +3257,7 @@ impl Engine {
             (capture_mode && !self.capture_realtime) || self.input_playback.is_some(),
         );
         let mp_typing = self.multiplayer.wants_keyboard_input();
-        let raw_requested_hose = if !active || mp_typing {
+        let raw_requested_hose = if !active || mp_typing || (!focused && !capture_mode && playback_frame.is_none()) {
             None
         } else if let Some(frame) = playback_frame {
             if frame.paint {
@@ -3281,7 +3281,7 @@ impl Engine {
         };
         let mut requested_hose = None;
         let mut input = controller::Input::default();
-        if active && !capture_mode && !mp_typing {
+        if active && focused && !capture_mode && !mp_typing {
             let mut movement_pad = self.pad;
             let use_pressed = self.pad_edges & 0x5000 != 0
                 || ui.input(|i| i.key_pressed(egui::Key::G));

@@ -776,7 +776,7 @@ impl Bootstrap {
         }
         self.playtest_pad=pad.buttons;
         let origin=*self.playtest_origin.get_or_insert_with(||events.playtest_player_matrix());
-        controller.advance_with(&world.collision,super::STEP as f64,(self.capture.is_some()||ctx.input(|i|i.focused)),input,|_,_|Ok::<_,anyhow::Error>(())).map_err(|e|anyhow::anyhow!("{e}"))?;
+        controller.advance_with(&world.collision,super::STEP as f64,true,input,|_,_|Ok::<_,anyhow::Error>(())).map_err(|e|anyhow::anyhow!("{e}"))?;
         let position=controller.player.position;
         if controller.motion_enabled {events.publish_playtest_player_pose(position,controller.player.yaw)?;}
         let source=events.playtest_player_source();
