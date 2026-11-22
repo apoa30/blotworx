@@ -20,7 +20,7 @@ pub fn panel(ctx:&egui::Context, open:&mut bool, tab:&mut usize, contents:impl F
             ui.spacing_mut().item_spacing=egui::vec2(10.,8.);
             ui.set_width(width-40.);ui.set_min_height(height-40.);
             ui.horizontal_wrapped(|ui|{ui.strong("BLOTWORX");ui.add_space(24.);
-              for (i,n) in ["Graphics","Display & controls","Game","Tools"].iter().enumerate(){ui.selectable_value(tab,i,*n);}
+              for (i,n) in ["Graphics","Display & controls","Game","Tools","Multiplayer"].iter().enumerate(){ui.selectable_value(tab,i,*n);}
               ui.with_layout(egui::Layout::right_to_left(egui::Align::Center),|ui|{if ui.button("Close · F10").clicked(){*open=false;}});
             });ui.separator();ui.add_space(10.);
             let selected=*tab;
@@ -160,6 +160,7 @@ impl Preferences {
         ui.add(egui::Slider::new(&mut self.fov,40.0..=100.0).text("Gameplay field of view"));
         ui.add_space(12.);ui.weak("WASD · Move     Space · Jump     Q / E · Paint / Thinner     F · Spin");
         ui.weak("Right drag · Camera     Wheel · Zoom     Esc · Pause     F3 · Debug");
+        ui.weak("F9 · Multiplayer (16p)     T · Text Chat     Hold V · Proximity Voice");
         distance
     }
     pub fn save(&self) -> anyhow::Result<()> {

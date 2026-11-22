@@ -1735,7 +1735,12 @@ impl GpuViewportCache {
             gl.disable(glow::BLEND);
         }
         if let Some(face) = source.cull {
+            let m = &cmd.trans_mat;
+            let det = m[0] * (m[5] * m[10] - m[6] * m[9])
+                - m[4] * (m[1] * m[10] - m[2] * m[9])
+                + m[8] * (m[1] * m[6] - m[2] * m[5]);
             gl.enable(glow::CULL_FACE);
+            gl.front_face(if det < 0.0 { glow::CW } else { glow::CCW });
             gl.cull_face(face);
         } else {
             gl.disable(glow::CULL_FACE);
@@ -3218,8 +3223,32 @@ pub(crate) fn render_viewport(
                             }
                         }
                         if backface_culling {
-                            gl.enable(glow::CULL_FACE);
-                            gl.cull_face(glow::BACK);
+                            let stencil_cull = cmd
+                                .material
+                                .as_ref()
+                                .and_then(|mat| mat.legacy_stencil_flags.as_ref())
+                                .and_then(|res| res.as_ref().ok().copied())
+                                .map(|flags| match (flags >> 10) & 3 {
+                                    0 | 1 => Some(glow::BACK),
+                                    2 => Some(glow::FRONT),
+                                    _ => None,
+                                })
+                                .unwrap_or(Some(glow::BACK));
+                            if let Some(face) = stencil_cull {
+                                let m = &cmd.trans_mat;
+                                let det = m[0] * (m[5] * m[10] - m[6] * m[9])
+                                    - m[4] * (m[1] * m[10] - m[2] * m[9])
+                                    + m[8] * (m[1] * m[6] - m[2] * m[5]);
+                                gl.enable(glow::CULL_FACE);
+                                gl.front_face(if (det < 0.0) ^ flip_winding {
+                                    glow::CW
+                                } else {
+                                    glow::CCW
+                                });
+                                gl.cull_face(face);
+                            } else {
+                                gl.disable(glow::CULL_FACE);
+                            }
                         } else {
                             gl.disable(glow::CULL_FACE);
                         }

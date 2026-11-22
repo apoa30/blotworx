@@ -77,6 +77,8 @@ mod usable_selection;
 mod usable_prompt;
 #[cfg(not(target_os = "horizon"))]
 mod disc_setup;
+#[cfg(not(target_os = "horizon"))]
+mod multiplayer;
 pub mod export_3ds;
 #[cfg(not(target_os = "horizon"))]
 mod updater;
@@ -833,6 +835,7 @@ struct Options {
     capture_tick: Option<u64>,
     capture_movie_frame: Option<u32>,
     capture_switch_level: Option<String>,
+    join: Option<String>,
 }
 fn options() -> Result<Options> {
     let mut o = Options {
@@ -891,6 +894,7 @@ fn options() -> Result<Options> {
         capture_tick: None,
         capture_movie_frame: None,
         capture_switch_level: None,
+        join: None,
     };
     let mut args = std::env::args().skip(1).peekable();
     let diagnostic = args.next_if(|arg| arg == "diagnose").is_some();
@@ -902,10 +906,15 @@ fn options() -> Result<Options> {
         o.updates = true;
     }
     while let Some(a) = args.next() {
-        if !diagnostic && !matches!(a.as_str(), "--help" | "-h" | "--data" | "--level" | "--continue" | "--shared-playtest") {
+        if a.starts_with("blotworx://") || a.starts_with("BLOTWORX://") {
+            o.join = Some(a);
+            continue;
+        }
+        if !diagnostic && !matches!(a.as_str(), "--help" | "-h" | "--data" | "--level" | "--continue" | "--shared-playtest" | "--join") {
             anyhow::bail!("Unknown launch option {a}. Use the in-game menus or run blotworx diagnose --help for developer tools.");
         }
         match a.as_str() {
+            "--join" => o.join = Some(args.next().context("--join needs an IP:port or blotworx:// link")?),
             "--continue" => o.continue_checkpoint = true,
             "--save-dir" => {
                 o.save_directory = Some(PathBuf::from(
@@ -2603,6 +2612,7 @@ struct Engine {
     pause_pointer: ui_movie::PausePointer,
     previous_buttons: u16,
     pad_edges: u16,
+    multiplayer: multiplayer::Multiplayer,
 }
 #[cfg(not(target_os = "horizon"))]
 impl Engine {
@@ -2701,7 +2711,7 @@ impl Engine {
             authored_preview: None,
             ear_pose: None,
             root,
-            level: o.level,
+            level: o.level.clone(),
             level_catalog: Vec::new(),
             level_catalog_root: String::new(),
             level_filter: String::new(),
@@ -2736,7 +2746,7 @@ impl Engine {
                 show_grid: false,
                 show_markers: false,
                 show_labels: false,
-                backface_culling: false,
+                backface_culling: true,
                 render_mode: RenderMode::Lit,
                 lighting_mode: LightingMode::Headlight,
                 ..Default::default()
@@ -2770,6 +2780,7 @@ impl Engine {
             pause_pointer: Default::default(),
             previous_buttons: 0,
             pad_edges: 0,
+            multiplayer: multiplayer::Multiplayer::new(&o.level, o.join),
         };
         if let Some(profile)=o.graphics_profile{s.preferences.profile=profile;}
         s.zoom=s.preferences.distance;
@@ -3245,7 +3256,8 @@ impl Engine {
             active,
             (capture_mode && !self.capture_realtime) || self.input_playback.is_some(),
         );
-        let raw_requested_hose = if !active {
+        let mp_typing = self.multiplayer.wants_keyboard_input();
+        let raw_requested_hose = if !active || mp_typing {
             None
         } else if let Some(frame) = playback_frame {
             if frame.paint {
@@ -3269,7 +3281,7 @@ impl Engine {
         };
         let mut requested_hose = None;
         let mut input = controller::Input::default();
-        if active && !capture_mode {
+        if active && !capture_mode && !mp_typing {
             let mut movement_pad = self.pad;
             let use_pressed = self.pad_edges & 0x5000 != 0
                 || ui.input(|i| i.key_pressed(egui::Key::G));
@@ -4239,6 +4251,8 @@ impl Engine {
                 self.render_probe_done = true;
             }
         }
+        self.multiplayer.apply_player_draws(world, &mut draws);
+        let mut draw_index = 0usize;
         draws.retain(|draw| {
             let visible = !world.hidden_jigsaw_draws.contains(&draw_index)
                 && !world.hidden_entity_draws.contains(&draw_index)
@@ -4472,6 +4486,32 @@ impl Engine {
                 egui::Color32::from_black_alpha(alpha),
             );
         }
+        if !capture_mode {
+            let level_name = world.report.level.clone();
+            let p_vel = player.velocity;
+            let p_yaw = player.yaw;
+            let p_grounded = player.grounded;
+            let p_spinning = self.spin_preview_pending
+                || world.spin_ribbon.is_some();
+            self.multiplayer.tick(
+                ui.ctx(),
+                &level_name,
+                position,
+                p_vel,
+                p_yaw,
+                p_grounded,
+                p_spinning,
+                requested_hose,
+                eye,
+                billboard_right,
+            );
+            self.multiplayer
+                .draw_overlays(ui, rect, &view_projection, position);
+            if let Some(target_level) = self.multiplayer.take_requested_level_switch() {
+                self.level = target_level;
+                self.load(ui.ctx());
+            }
+        }
     }
 }
 #[cfg(not(target_os = "horizon"))]
@@ -4582,10 +4622,11 @@ impl Engine {
             }
 
                    },
-                   _=>{
-                    ui.checkbox(&mut self.debug.open,"Debug overlay Â· F3");ui.checkbox(&mut self.details,"Level report");
+                   3=>{
+                    ui.checkbox(&mut self.debug.open,"Debug overlay · F3");ui.checkbox(&mut self.details,"Level report");
                     ui.checkbox(&mut self.retail_lighting,"Game materials and lighting");
                     ui.checkbox(&mut self.camera.view_culling,"View culling");
+                    ui.checkbox(&mut self.camera.backface_culling,"Backface culling");
                     ui.checkbox(&mut self.camera.show_limitations,"Material warnings");
                     ui.checkbox(&mut self.paused,"Pause simulation");
                     if let Some(world) = self.world.as_mut() {
@@ -4602,6 +4643,8 @@ impl Engine {
                         }
                     }
                    }
+                   4 => self.multiplayer.draw_lobby_contents(ui, ctx),
+                   _ => {}
                   }
         });
         self.options_open=open;self.options_tab=tab;
@@ -4713,6 +4756,7 @@ impl eframe::App for Engine {
                             preview.time = 0.;
                         }
                         viewport3d::clear_gpu_cache();
+                        self.multiplayer.on_level_loaded(&world.report.level);
                         if let Some(left) = self.diagnostic_shuffle {
                             let result = (|| -> Result<()> {
                                 let preview = self
@@ -5026,7 +5070,7 @@ impl eframe::App for Engine {
         let escape = ui.input(|i| i.focused && i.events.iter().any(|event| matches!(event,
             egui::Event::Key { key: egui::Key::Escape, pressed: true, repeat: false, .. })));
         let start = edge & 0x10 != 0 && ui.input(|i| i.focused);
-        let pause_pressed = escape || start;
+        let pause_pressed = (escape && !self.multiplayer.is_chat_open()) || start;
         if self.capture.is_none() && pause_pressed {
             if self.options_open {
                 self.options_open = false;

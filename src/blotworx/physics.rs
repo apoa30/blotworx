@@ -4089,9 +4089,12 @@ impl Player {
             }
         }
         if ground_motion && self.jump_stage.is_none() {
-            // On a steep sliding slope, strip uphill input so Mickey slides
+            // On a sustained steep sliding slope, strip uphill input so Mickey slides
             // cleanly down the slope instead of climbing or fighting double gravity.
-            if self.support_state == Some(super::support::State::Sliding) {
+            // Brief 1-frame bevel-edge touches on stair risers (< 80ms) must not cancel climbing.
+            if self.support_state == Some(super::support::State::Sliding)
+                && self.sliding_timer >= 0.08
+            {
                 if let Some(normal) = support_normal {
                     let horiz_len = normal[0].hypot(normal[2]);
                     if horiz_len > 1e-4 {

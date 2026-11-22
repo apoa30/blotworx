@@ -337,9 +337,99 @@ impl World {
             .set_simulation_velocity(shape, player.velocity)?;
         self.collision
             .set_character_response(player.velocity, body.response_limit)?;
+        let start_pos = player.position;
+        let requested_vel = player.velocity;
         let start = self.dynamic_runtime_time;
         self.advance_dynamic_physics(dt)?;
         let mut pose = self.collision.simulation_pose(shape)?;
+        // Stair step-up solver: when Mickey walks into a stair riser while grounded
+        // (or retaining stair ground context) and the rigid-body hull stops horizontally
+        // against the vertical step face, probe for a walkable flat stair tread within
+        // PlayerStairHeight (0.3..0.48m) with clear headroom and step smoothly onto it.
+        if (player.grounded || player.stairs_ground_retained)
+            && !player.ledge.is_active()
+            && !player.native_knockback
+            && !player.damage_leaping
+            && !player.ground_jump_started
+            && player.jump_stage.is_none()
+        {
+            let req_dx = requested_vel[0] * dt;
+            let req_dz = requested_vel[2] * dt;
+            let req_dist = req_dx.hypot(req_dz);
+            if req_dist > 0.008 {
+                let dir_x = req_dx / req_dist;
+                let dir_z = req_dz / req_dist;
+                let act_progress = (pose.position[0] - start_pos[0]) * dir_x
+                    + (pose.position[2] - start_pos[2]) * dir_z;
+                if act_progress < req_dist * 0.70 {
+                    let max_step = player.motion.stairs.height.max(0.46);
+                    let slope_cos = player.motion.max_slope_degrees.to_radians().cos();
+                    let probe_ahead = req_dist.max(0.32).min(0.55);
+                    let step_x = start_pos[0] + dir_x * probe_ahead;
+                    let step_z = start_pos[2] + dir_z * probe_ahead;
+                    let down_origin = [step_x, start_pos[1] + max_step + 0.14, step_z];
+                    let tread_hit = self
+                        .collision
+                        .with_player_queries(|| {
+                            Ok::<_, anyhow::Error>(self.collision.ray_hit(
+                                down_origin,
+                                [0., -1., 0.],
+                                max_step + 0.20,
+                            ))
+                        })
+                        .ok()
+                        .flatten();
+                    if let Some(hit) = tread_hit {
+                        let tread_y = down_origin[1] - hit.distance;
+                        let rise = tread_y - start_pos[1];
+                        if rise > 0.015 && rise <= max_step && hit.normal[1] >= slope_cos {
+                            // Verify forward clearance above the step riser and headroom above tread
+                            let fwd_clear = self
+                                .collision
+                                .with_player_queries(|| {
+                                    Ok::<_, anyhow::Error>(self.collision.ray_hit(
+                                        [start_pos[0], tread_y + 0.22, start_pos[2]],
+                                        [dir_x, 0., dir_z],
+                                        probe_ahead + 0.22,
+                                    ))
+                                })
+                                .ok()
+                                .flatten()
+                                .is_none();
+                            let head_clear = self
+                                .collision
+                                .with_player_queries(|| {
+                                    Ok::<_, anyhow::Error>(self.collision.ray_hit(
+                                        [step_x, tread_y + 0.18, step_z],
+                                        [0., 1., 0.],
+                                        1.30,
+                                    ))
+                                })
+                                .ok()
+                                .flatten()
+                                .is_none();
+                            if fwd_clear && head_clear {
+                                let advance = req_dist.max(0.06);
+                                let new_pos = [
+                                    start_pos[0] + dir_x * advance,
+                                    tread_y + 0.01,
+                                    start_pos[2] + dir_z * advance,
+                                ];
+                                let delta = super::physics::sub(new_pos, pose.position);
+                                self.collision
+                                    .set_shape_transform(shape, new_pos, orientation)?;
+                                let next_vel = [requested_vel[0], 0.0, requested_vel[2]];
+                                self.collision.set_simulation_velocity(shape, next_vel)?;
+                                pose.position = new_pos;
+                                pose.center = super::physics::add(pose.center, delta);
+                                pose.linear = next_vel;
+                                player.grounded = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
         if player.ledge.is_active() {
             pose.position = player.position;
             pose.linear = [0.; 3];
