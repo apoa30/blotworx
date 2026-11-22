@@ -10,17 +10,17 @@ use super::protocol::{pants_color, FLAG_JUMPING, FLAG_SPINNING, FLAG_SPRAY_PAINT
 use crate::render_support::{material_preview::MaterialImage, viewport3d::GpuDrawCommand};
 use std::{collections::HashMap, sync::Arc};
 
-/// Cached recolored RGBA textures keyed by `(original_rgba_ptr, color_slot)`.
+/// Cached recolored diffuse RGBA textures keyed by `(original_rgba_ptr, color_slot)`.
+/// NOTE: Only immutable diffuse `Arc<Vec<u8>>` textures are cached — never the outer
+/// `Vec<MaterialImage>` which `apply_spherical_lighting` rebuilds every frame with live SH lighting.
 #[derive(Default)]
 pub struct PantsTextureCache {
     by_rgba: HashMap<(usize, u8), Arc<Vec<u8>>>,
-    by_mat_list: HashMap<(usize, u8), Arc<Vec<MaterialImage>>>,
 }
 
 impl PantsTextureCache {
     pub fn clear(&mut self) {
         self.by_rgba.clear();
-        self.by_mat_list.clear();
     }
 
     fn recolor_rgba(&mut self, src: &Arc<Vec<u8>>, color_slot: u8) -> Arc<Vec<u8>> {
@@ -34,36 +34,8 @@ impl PantsTextureCache {
         out
     }
 
-    fn recolor_material_images(
-        &mut self,
-        src: &Arc<Vec<MaterialImage>>,
-        color_slot: u8,
-    ) -> Arc<Vec<MaterialImage>> {
-        let key = (Arc::as_ptr(src) as usize, color_slot);
-        if let Some(cached) = self.by_mat_list.get(&key) {
-            return cached.clone();
-        }
-        let mut next = Vec::with_capacity(src.len());
-        for img in src.iter() {
-            // Slot 0 (or diffuse albedo maps with red shorts pixels) gets recolored;
-            // non-albedo lookup/specular/normal slots generally have no saturated pure red shorts band
-            // or are slot > 0 — we recolor slot 0 directly so normal/specular/rim maps stay untouched.
-            if img.slot == 0 && !img.rgba.is_empty() {
-                let recolored = self.recolor_rgba(&img.rgba, color_slot);
-                next.push(MaterialImage {
-                    rgba: recolored,
-                    ..img.clone()
-                });
-            } else {
-                next.push(img.clone());
-            }
-        }
-        let arc = Arc::new(next);
-        self.by_mat_list.insert(key, arc.clone());
-        arc
-    }
-
-    /// Apply a player's unique pants color to a cloned Mickey draw command.
+    /// Apply a player's unique pants color to a Mickey draw command while preserving
+    /// all live spherical-lighting / normal / specular texture slots intact.
     pub fn apply_to_draw(&mut self, draw: &mut GpuDrawCommand, color_slot: u8) {
         if let Some((ref rgba, w, h)) = draw.tex_bytes {
             if !rgba.is_empty() {
@@ -71,8 +43,20 @@ impl PantsTextureCache {
                 draw.tex_bytes = Some((recolored, w, h));
             }
         }
-        if !draw.material_images.is_empty() {
-            draw.material_images = self.recolor_material_images(&draw.material_images, color_slot);
+        if draw.material_images.iter().any(|img| img.slot == 0 && !img.rgba.is_empty()) {
+            let mut next = Vec::with_capacity(draw.material_images.len());
+            for img in draw.material_images.iter() {
+                if img.slot == 0 && !img.rgba.is_empty() {
+                    let recolored = self.recolor_rgba(&img.rgba, color_slot);
+                    next.push(MaterialImage {
+                        rgba: recolored,
+                        ..img.clone()
+                    });
+                } else {
+                    next.push(img.clone());
+                }
+            }
+            draw.material_images = Arc::new(next);
         }
     }
 }

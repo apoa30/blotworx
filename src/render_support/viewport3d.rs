@@ -1734,13 +1734,13 @@ impl GpuViewportCache {
         } else {
             gl.disable(glow::BLEND);
         }
+        let m = &cmd.trans_mat;
+        let det = m[0] * (m[5] * m[10] - m[6] * m[9])
+            - m[4] * (m[1] * m[10] - m[2] * m[9])
+            + m[8] * (m[1] * m[6] - m[2] * m[5]);
+        gl.front_face(if det < 0.0 { glow::CW } else { glow::CCW });
         if let Some(face) = source.cull {
-            let m = &cmd.trans_mat;
-            let det = m[0] * (m[5] * m[10] - m[6] * m[9])
-                - m[4] * (m[1] * m[10] - m[2] * m[9])
-                + m[8] * (m[1] * m[6] - m[2] * m[5]);
             gl.enable(glow::CULL_FACE);
-            gl.front_face(if det < 0.0 { glow::CW } else { glow::CCW });
             gl.cull_face(face);
         } else {
             gl.disable(glow::CULL_FACE);
@@ -3222,6 +3222,15 @@ pub(crate) fn render_viewport(
                                 }
                             }
                         }
+                        let m = &cmd.trans_mat;
+                        let det = m[0] * (m[5] * m[10] - m[6] * m[9])
+                            - m[4] * (m[1] * m[10] - m[2] * m[9])
+                            + m[8] * (m[1] * m[6] - m[2] * m[5]);
+                        gl.front_face(if (det < 0.0) ^ flip_winding {
+                            glow::CW
+                        } else {
+                            glow::CCW
+                        });
                         if backface_culling {
                             let stencil_cull = cmd
                                 .material
@@ -3235,16 +3244,7 @@ pub(crate) fn render_viewport(
                                 })
                                 .unwrap_or(Some(glow::BACK));
                             if let Some(face) = stencil_cull {
-                                let m = &cmd.trans_mat;
-                                let det = m[0] * (m[5] * m[10] - m[6] * m[9])
-                                    - m[4] * (m[1] * m[10] - m[2] * m[9])
-                                    + m[8] * (m[1] * m[6] - m[2] * m[5]);
                                 gl.enable(glow::CULL_FACE);
-                                gl.front_face(if (det < 0.0) ^ flip_winding {
-                                    glow::CW
-                                } else {
-                                    glow::CCW
-                                });
                                 gl.cull_face(face);
                             } else {
                                 gl.disable(glow::CULL_FACE);

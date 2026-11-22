@@ -1,10 +1,17 @@
-//! 16-player UDP Host Server & Client networking for Blotworx Online Multiplayer.
+//! 16-player Host Server & Client networking for Blotworx Online Multiplayer.
+//!
+//! Supports two transports seamlessly:
+//! 1. **Online Room Code (Default — Zero Port Forwarding)**: Outbound TCP MQTT v3.1.1 relay
+//!    (`broker.emqx.io:1883` with automatic fallback to `broker.hivemq.com:1883`). Works through
+//!    home routers, strict NAT, CGNAT, and firewalls with zero configuration.
+//! 2. **Direct LAN UDP (`IP:Port`)**: Direct peer-to-peer UDP for local networks or forwarded hosts.
 
 use super::protocol::{
-    level_hash, preferred_color_slot, sanitize_username, ChatPacket, NetPlayerState, Packet,
-    PlayerInfo, MAX_PLAYERS,
+    level_hash, pants_color, preferred_color_slot, sanitize_username, ChatPacket, NetPlayerState,
+    Packet, PlayerInfo, MAX_PLAYERS,
 };
-use anyhow::{Context, Result};
+use super::relay::{self, RelayConn};
+use anyhow::{bail, Context, Result};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     net::{SocketAddr, ToSocketAddrs, UdpSocket},
@@ -13,18 +20,162 @@ use std::{
         mpsc, Arc,
     },
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-const TIMEOUT_SECS: u64 = 10;
+const TIMEOUT_SECS: u64 = 12;
 const SNAPSHOT_INTERVAL_MS: u64 = 33; // ~30 Hz world snapshots
 const HEARTBEAT_INTERVAL_MS: u64 = 2000;
 const PROXIMITY_RELAY_MAX_SQ: f32 = 75.0 * 75.0; // relay voice within generous 75m radius; client attenuates precisely
 
+fn unique_tag(prefix: &str) -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(1);
+    let tid = format!("{:?}", thread::current().id());
+    let mut h: u32 = 0x811c9dc5;
+    for b in tid.bytes() {
+        h ^= b as u32;
+        h = h.wrapping_mul(0x01000193);
+    }
+    format!(
+        "{prefix}{:08x}{:04x}",
+        (nanos as u32) ^ h,
+        (std::process::id() as u16) ^ ((nanos >> 32) as u16)
+    )
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum PeerAddr {
+    Udp(SocketAddr),
+    Relay(String),
+}
+
+// ------------------------------------------------------------------ Server Transport
+
+enum ServerTransport {
+    Udp(UdpSocket),
+    Relay {
+        conn: RelayConn,
+        room_code: String,
+        c2s_prefix: String,
+        host_client_id: String,
+    },
+}
+
+impl ServerTransport {
+    fn recv_packets(&mut self, buf: &mut [u8]) -> Vec<(PeerAddr, Packet)> {
+        let mut out = Vec::new();
+        match self {
+            ServerTransport::Udp(sock) => {
+                while let Ok((len, from)) = sock.recv_from(buf) {
+                    if let Some(pkt) = Packet::decode(&buf[..len]) {
+                        out.push((PeerAddr::Udp(from), pkt));
+                    }
+                }
+            }
+            ServerTransport::Relay {
+                conn,
+                room_code,
+                c2s_prefix,
+                host_client_id,
+            } => {
+                let _ = conn.maybe_ping();
+                match conn.poll_messages() {
+                    Ok(msgs) => {
+                        for (topic, payload) in msgs {
+                            if let Some(client_tag) = topic.strip_prefix(c2s_prefix.as_str()) {
+                                if !client_tag.is_empty() && !client_tag.contains('/') {
+                                    if let Some(pkt) = Packet::decode(&payload) {
+                                        out.push((PeerAddr::Relay(client_tag.to_owned()), pkt));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        // Attempt transparent reconnect to relay broker
+                        if let Ok(mut new_conn) = RelayConn::connect(None, host_client_id) {
+                            if new_conn
+                                .subscribe(&relay::topic_c2s_wildcard(room_code))
+                                .is_ok()
+                            {
+                                *conn = new_conn;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    fn send_raw_to(&mut self, addr: &PeerAddr, bytes: &[u8]) {
+        match (self, addr) {
+            (ServerTransport::Udp(sock), PeerAddr::Udp(sa)) => {
+                let _ = sock.send_to(bytes, *sa);
+            }
+            (
+                ServerTransport::Relay {
+                    conn, room_code, ..
+                },
+                PeerAddr::Relay(tag),
+            ) => {
+                let topic = relay::topic_s2c_direct(room_code, tag);
+                let _ = conn.publish(&topic, bytes);
+            }
+            _ => {}
+        }
+    }
+
+    fn send_to(&mut self, addr: &PeerAddr, pkt: &Packet) {
+        let bytes = pkt.encode();
+        self.send_raw_to(addr, &bytes);
+    }
+
+    fn broadcast(
+        &mut self,
+        slots: &[Option<ServerSlot>; MAX_PLAYERS],
+        pkt: &Packet,
+        exclude: Option<u8>,
+    ) {
+        let bytes = pkt.encode();
+        match self {
+            ServerTransport::Udp(sock) => {
+                for slot in slots.iter().flatten() {
+                    if exclude != Some(slot.info.id) {
+                        if let PeerAddr::Udp(sa) = slot.addr {
+                            let _ = sock.send_to(&bytes, sa);
+                        }
+                    }
+                }
+            }
+            ServerTransport::Relay {
+                conn, room_code, ..
+            } => {
+                if exclude.is_none() {
+                    let topic = relay::topic_s2c_broadcast(room_code);
+                    let _ = conn.publish(&topic, &bytes);
+                } else {
+                    for slot in slots.iter().flatten() {
+                        if exclude != Some(slot.info.id) {
+                            if let PeerAddr::Relay(tag) = &slot.addr {
+                                let topic = relay::topic_s2c_direct(room_code, tag);
+                                let _ = conn.publish(&topic, &bytes);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 // ------------------------------------------------------------------ Host Server
 
 struct ServerSlot {
-    addr: SocketAddr,
+    addr: PeerAddr,
     info: PlayerInfo,
     state: NetPlayerState,
     last_seen: Instant,
@@ -32,21 +183,70 @@ struct ServerSlot {
 
 pub struct HostServer {
     running: Arc<AtomicBool>,
-    pub bound_addr: SocketAddr,
+    pub bound_addr: Option<SocketAddr>,
+    pub room_code: Option<String>,
+    pub broker_addr: Option<String>,
     pub session_id: String,
     handle: Option<thread::JoinHandle<()>>,
 }
 
 impl HostServer {
-    pub fn start(port: u16, initial_level: String) -> Result<Self> {
+    /// Start an online lobby using the zero-port-forwarding Room Code relay (default).
+    pub fn start_online(raw_room_code: String, initial_level: String) -> Result<Self> {
+        let room_code = {
+            let norm = relay::normalize_room_code(&raw_room_code);
+            if norm.len() >= 4 {
+                norm
+            } else {
+                relay::generate_room_code()
+            }
+        };
+        let host_client_id = unique_tag("bwh-");
+        let mut conn = RelayConn::connect(None, &host_client_id)
+            .context("Connect to online multiplayer relay")?;
+        conn.subscribe(&relay::topic_c2s_wildcard(&room_code))
+            .context("Subscribe to online room channel")?;
+        let broker_addr = conn.broker_addr.clone();
+        let session_id = format!("bw-room-{room_code}");
+        let c2s_prefix = format!("blotworx/mp/v1/{room_code}/c2s/");
+
+        let running = Arc::new(AtomicBool::new(true));
+        let r_flag = running.clone();
+        let sid = session_id.clone();
+        let rc_thread = room_code.clone();
+
+        let transport = ServerTransport::Relay {
+            conn,
+            room_code: rc_thread,
+            c2s_prefix,
+            host_client_id,
+        };
+
+        let handle = thread::Builder::new()
+            .name("blotworx-mp-relay-host".into())
+            .spawn(move || server_loop(transport, sid, initial_level, r_flag))
+            .context("Spawn multiplayer online host thread")?;
+
+        Ok(Self {
+            running,
+            bound_addr: None,
+            room_code: Some(room_code),
+            broker_addr: Some(broker_addr),
+            session_id,
+            handle: Some(handle),
+        })
+    }
+
+    /// Start a direct LAN UDP server on `port` (optional fallback for local networks).
+    pub fn start_lan(port: u16, initial_level: String) -> Result<Self> {
         let socket = UdpSocket::bind(("0.0.0.0", port))
             .with_context(|| format!("Bind multiplayer UDP server on port {port}"))?;
         socket.set_nonblocking(true)?;
         let bound_addr = socket.local_addr()?;
         let session_id = format!(
             "bw-{:08x}{:04x}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_secs() as u32)
                 .unwrap_or(1),
             bound_addr.port()
@@ -56,13 +256,15 @@ impl HostServer {
         let sid = session_id.clone();
 
         let handle = thread::Builder::new()
-            .name("blotworx-mp-server".into())
-            .spawn(move || server_loop(socket, sid, initial_level, r_flag))
-            .context("Spawn multiplayer host server thread")?;
+            .name("blotworx-mp-udp-host".into())
+            .spawn(move || server_loop(ServerTransport::Udp(socket), sid, initial_level, r_flag))
+            .context("Spawn multiplayer LAN host thread")?;
 
         Ok(Self {
             running,
-            bound_addr,
+            bound_addr: Some(bound_addr),
+            room_code: None,
+            broker_addr: None,
             session_id,
             handle: Some(handle),
         })
@@ -79,7 +281,7 @@ impl Drop for HostServer {
 }
 
 fn server_loop(
-    socket: UdpSocket,
+    mut transport: ServerTransport,
     session_id: String,
     mut host_level: String,
     running: Arc<AtomicBool>,
@@ -92,23 +294,6 @@ fn server_loop(
     let mut last_snapshot = Instant::now();
     let mut buf = [0u8; 2048];
 
-    let send_to = |sock: &UdpSocket, addr: SocketAddr, pkt: &Packet| {
-        let bytes = pkt.encode();
-        let _ = sock.send_to(&bytes, addr);
-    };
-
-    let broadcast = |sock: &UdpSocket,
-                     slots: &[Option<ServerSlot>; MAX_PLAYERS],
-                     pkt: &Packet,
-                     exclude: Option<u8>| {
-        let bytes = pkt.encode();
-        for slot in slots.iter().flatten() {
-            if exclude != Some(slot.info.id) {
-                let _ = sock.send_to(&bytes, slot.addr);
-            }
-        }
-    };
-
     let build_roster = |slots: &[Option<ServerSlot>; MAX_PLAYERS]| -> Vec<PlayerInfo> {
         slots
             .iter()
@@ -118,16 +303,18 @@ fn server_loop(
     };
 
     while running.load(Ordering::Acquire) {
-        let mut received_any = false;
-        while let Ok((len, from)) = socket.recv_from(&mut buf) {
-            received_any = true;
-            let Some(pkt) = Packet::decode(&buf[..len]) else {
-                continue;
-            };
+        let incoming = transport.recv_packets(&mut buf);
+        let received_any = !incoming.is_empty();
+
+        for (from, pkt) in incoming {
             let now = Instant::now();
 
             match pkt {
-                Packet::JoinRequest { username, level } => {
+                Packet::JoinRequest {
+                    username,
+                    level,
+                    preferred_color,
+                } => {
                     let clean_name = sanitize_username(&username);
                     // Re-accept if the same endpoint is already in the lobby
                     if let Some(existing_idx) = slots
@@ -139,9 +326,8 @@ fn server_loop(
                             let id = slot.info.id;
                             let color_slot = slot.info.color_slot;
                             let roster = build_roster(&slots);
-                            send_to(
-                                &socket,
-                                from,
+                            transport.send_to(
+                                &from,
                                 &Packet::JoinAccept {
                                     player_id: id,
                                     color_slot,
@@ -156,9 +342,8 @@ fn server_loop(
 
                     // Find first free player ID slot (0..16)
                     let Some(free_id) = slots.iter().position(|s| s.is_none()) else {
-                        send_to(
-                            &socket,
-                            from,
+                        transport.send_to(
+                            &from,
                             &Packet::JoinReject {
                                 reason: format!("Lobby is full ({MAX_PLAYERS}/{MAX_PLAYERS})"),
                             },
@@ -166,17 +351,22 @@ fn server_loop(
                         continue;
                     };
 
-                    // Pick unique pants color: start at deterministic hash of username, advance if taken
+                    // Pick unique pants color: honor player's chosen color if free, else hash username
                     let used_colors: HashSet<u8> = slots
                         .iter()
                         .flatten()
                         .map(|s| s.info.color_slot)
                         .collect();
-                    let pref = preferred_color_slot(&clean_name);
-                    let color_slot = (0..MAX_PLAYERS as u8)
-                        .map(|offset| (pref + offset) % (MAX_PLAYERS as u8))
-                        .find(|c| !used_colors.contains(c))
-                        .unwrap_or(free_id as u8);
+                    let color_slot =
+                        if (preferred_color as usize) < MAX_PLAYERS && !used_colors.contains(&preferred_color) {
+                            preferred_color
+                        } else {
+                            let pref = preferred_color_slot(&clean_name);
+                            (0..MAX_PLAYERS as u8)
+                                .map(|offset| (pref + offset) % (MAX_PLAYERS as u8))
+                                .find(|c| !used_colors.contains(c))
+                                .unwrap_or(free_id as u8)
+                        };
 
                     // Deduplicate identical usernames cleanly ("Mickey", "Mickey (2)", ...)
                     let mut final_name = clean_name.clone();
@@ -212,16 +402,15 @@ fn server_loop(
                         level_hash: level_hash(&player_level),
                     };
                     slots[free_id] = Some(ServerSlot {
-                        addr: from,
+                        addr: from.clone(),
                         info,
                         state,
                         last_seen: now,
                     });
 
                     let roster = build_roster(&slots);
-                    send_to(
-                        &socket,
-                        from,
+                    transport.send_to(
+                        &from,
                         &Packet::JoinAccept {
                             player_id: free_id as u8,
                             color_slot,
@@ -232,11 +421,10 @@ fn server_loop(
                     );
                     // Replay recent chat messages to newly joined player
                     for msg in &chat_history {
-                        send_to(&socket, from, &Packet::Chat(msg.clone()));
+                        transport.send_to(&from, &Packet::Chat(msg.clone()));
                     }
                     // Notify everyone of updated roster + system join message
-                    broadcast(
-                        &socket,
+                    transport.broadcast(
                         &slots,
                         &Packet::Roster {
                             host_level: host_level.clone(),
@@ -252,14 +440,14 @@ fn server_loop(
                         sender: String::new(),
                         text: format!(
                             "{final_name} joined ({} pants).",
-                            super::protocol::pants_color(color_slot).name
+                            pants_color(color_slot).name
                         ),
                     };
                     chat_history.push_back(sys_msg.clone());
                     while chat_history.len() > 40 {
                         chat_history.pop_front();
                     }
-                    broadcast(&socket, &slots, &Packet::Chat(sys_msg), None);
+                    transport.broadcast(&slots, &Packet::Chat(sys_msg), None);
                 }
 
                 Packet::Leave { player_id } => {
@@ -267,8 +455,7 @@ fn server_loop(
                         if slot.as_ref().is_some_and(|s| s.addr == from) {
                             let name = slot.take().unwrap().info.username;
                             let roster = build_roster(&slots);
-                            broadcast(
-                                &socket,
+                            transport.broadcast(
                                 &slots,
                                 &Packet::Roster {
                                     host_level: host_level.clone(),
@@ -285,7 +472,7 @@ fn server_loop(
                                 text: format!("{name} left the lobby."),
                             };
                             chat_history.push_back(sys_msg.clone());
-                            broadcast(&socket, &slots, &Packet::Chat(sys_msg), None);
+                            transport.broadcast(&slots, &Packet::Chat(sys_msg), None);
                         }
                     }
                 }
@@ -329,7 +516,7 @@ fn server_loop(
                             while chat_history.len() > 40 {
                                 chat_history.pop_front();
                             }
-                            broadcast(&socket, &slots, &Packet::Chat(msg), None);
+                            transport.broadcast(&slots, &Packet::Chat(msg), None);
                         }
                     }
                 }
@@ -360,16 +547,22 @@ fn server_loop(
                     }
                     .encode();
                     // Relay only to other players in the same level & within proximity relay radius
-                    for other in slots.iter().flatten() {
-                        if other.info.id == sender_id || other.state.level_hash != lh {
-                            continue;
-                        }
-                        let dx = other.state.pos[0] - pos[0];
-                        let dy = other.state.pos[1] - pos[1];
-                        let dz = other.state.pos[2] - pos[2];
-                        if dx * dx + dy * dy + dz * dz <= PROXIMITY_RELAY_MAX_SQ {
-                            let _ = socket.send_to(&bytes, other.addr);
-                        }
+                    let recipients: Vec<PeerAddr> = slots
+                        .iter()
+                        .flatten()
+                        .filter(|other| {
+                            if other.info.id == sender_id || other.state.level_hash != lh {
+                                return false;
+                            }
+                            let dx = other.state.pos[0] - pos[0];
+                            let dy = other.state.pos[1] - pos[1];
+                            let dz = other.state.pos[2] - pos[2];
+                            dx * dx + dy * dy + dz * dz <= PROXIMITY_RELAY_MAX_SQ
+                        })
+                        .map(|other| other.addr.clone())
+                        .collect();
+                    for addr in &recipients {
+                        transport.send_raw_to(addr, &bytes);
                     }
                 }
 
@@ -390,8 +583,7 @@ fn server_loop(
                     }
                     if changed {
                         let roster = build_roster(&slots);
-                        broadcast(
-                            &socket,
+                        transport.broadcast(
                             &slots,
                             &Packet::Roster {
                                 host_level: host_level.clone(),
@@ -399,6 +591,60 @@ fn server_loop(
                             },
                             None,
                         );
+                    }
+                }
+
+                Packet::ColorChange {
+                    player_id,
+                    color_slot,
+                } => {
+                    if (color_slot as usize) >= MAX_PLAYERS {
+                        continue;
+                    }
+                    let taken_by_other = slots
+                        .iter()
+                        .flatten()
+                        .any(|s| s.info.id != player_id && s.info.color_slot == color_slot);
+                    if taken_by_other {
+                        continue;
+                    }
+                    let mut changed_name: Option<String> = None;
+                    if let Some(Some(slot)) = slots.get_mut(player_id as usize) {
+                        if slot.addr == from {
+                            slot.last_seen = now;
+                            if slot.info.color_slot != color_slot {
+                                slot.info.color_slot = color_slot;
+                                slot.state.color_slot = color_slot;
+                                changed_name = Some(slot.info.username.clone());
+                            }
+                        }
+                    }
+                    if let Some(name) = changed_name {
+                        let roster = build_roster(&slots);
+                        transport.broadcast(
+                            &slots,
+                            &Packet::Roster {
+                                host_level: host_level.clone(),
+                                players: roster,
+                            },
+                            None,
+                        );
+                        next_msg_id = next_msg_id.wrapping_add(1);
+                        let sys_msg = ChatPacket {
+                            msg_id: next_msg_id,
+                            sender_id: 255,
+                            color_slot,
+                            sender: String::new(),
+                            text: format!(
+                                "{name} switched to {} pants.",
+                                pants_color(color_slot).name
+                            ),
+                        };
+                        chat_history.push_back(sys_msg.clone());
+                        while chat_history.len() > 40 {
+                            chat_history.pop_front();
+                        }
+                        transport.broadcast(&slots, &Packet::Chat(sys_msg), None);
                     }
                 }
 
@@ -427,8 +673,7 @@ fn server_loop(
         }
         if !removed_names.is_empty() {
             let roster = build_roster(&slots);
-            broadcast(
-                &socket,
+            transport.broadcast(
                 &slots,
                 &Packet::Roster {
                     host_level: host_level.clone(),
@@ -446,7 +691,7 @@ fn server_loop(
                     text: format!("{name} timed out."),
                 };
                 chat_history.push_back(sys_msg.clone());
-                broadcast(&socket, &slots, &Packet::Chat(sys_msg), None);
+                transport.broadcast(&slots, &Packet::Chat(sys_msg), None);
             }
         }
 
@@ -460,8 +705,7 @@ fn server_loop(
                 .map(|s| s.state.clone())
                 .collect();
             if !states.is_empty() {
-                broadcast(
-                    &socket,
+                transport.broadcast(
                     &slots,
                     &Packet::WorldSnapshot {
                         tick,
@@ -478,6 +722,54 @@ fn server_loop(
     }
 }
 
+// ------------------------------------------------------------------ Client Transport
+
+enum ClientTransport {
+    Udp(UdpSocket),
+    Relay {
+        conn: RelayConn,
+        c2s_topic: String,
+    },
+}
+
+impl ClientTransport {
+    fn send(&mut self, bytes: &[u8]) -> Result<()> {
+        match self {
+            ClientTransport::Udp(sock) => {
+                let _ = sock.send(bytes);
+                Ok(())
+            }
+            ClientTransport::Relay { conn, c2s_topic } => conn.publish(c2s_topic, bytes),
+        }
+    }
+
+    fn is_udp(&self) -> bool {
+        matches!(self, ClientTransport::Udp(_))
+    }
+
+    fn poll(&mut self, buf: &mut [u8]) -> Result<Vec<Packet>> {
+        let mut out = Vec::new();
+        match self {
+            ClientTransport::Udp(sock) => {
+                while let Ok(len) = sock.recv(buf) {
+                    if let Some(pkt) = Packet::decode(&buf[..len]) {
+                        out.push(pkt);
+                    }
+                }
+            }
+            ClientTransport::Relay { conn, .. } => {
+                conn.maybe_ping()?;
+                for (_topic, payload) in conn.poll_messages()? {
+                    if let Some(pkt) = Packet::decode(&payload) {
+                        out.push(pkt);
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+}
+
 // ------------------------------------------------------------------ Client
 
 pub enum ClientCmd {
@@ -489,6 +781,7 @@ pub enum ClientCmd {
         ulaw: Vec<u8>,
     },
     SendLevel(String),
+    SendColor(u8),
     Disconnect,
 }
 
@@ -524,31 +817,64 @@ pub struct NetClient {
 }
 
 impl NetClient {
-    pub fn connect(server_addr: &str, username: String, level: String) -> Result<Self> {
-        let resolved: SocketAddr = server_addr
-            .to_socket_addrs()
-            .with_context(|| format!("Resolve multiplayer server '{server_addr}'"))?
-            .find(|a| a.is_ipv4())
-            .or_else(|| server_addr.to_socket_addrs().ok()?.next())
-            .with_context(|| format!("No reachable address for '{server_addr}'"))?;
+    /// Connect to either an online Room Code (e.g. `BLOT-7K3P`, zero port forwarding)
+    /// or a direct LAN `IP:Port` address.
+    pub fn connect(
+        target: &str,
+        username: String,
+        preferred_color: u8,
+        level: String,
+    ) -> Result<Self> {
+        let (transport, display_target) = if relay::is_room_code_target(target) {
+            let stripped = target
+                .trim()
+                .strip_prefix("room:")
+                .or_else(|| target.trim().strip_prefix("ROOM:"))
+                .unwrap_or(target.trim());
+            let room_code = relay::normalize_room_code(stripped);
+            if room_code.len() < 4 {
+                bail!("Invalid room code '{target}'");
+            }
+            let client_tag = unique_tag("c");
+            let mut conn = RelayConn::connect(None, &format!("bwc-{client_tag}"))
+                .context("Connect to online multiplayer relay")?;
+            conn.subscribe(&relay::topic_s2c_broadcast(&room_code))
+                .context("Subscribe to room broadcast channel")?;
+            conn.subscribe(&relay::topic_s2c_direct(&room_code, &client_tag))
+                .context("Subscribe to room direct channel")?;
+            let c2s_topic = relay::topic_c2s(&room_code, &client_tag);
+            (
+                ClientTransport::Relay { conn, c2s_topic },
+                room_code,
+            )
+        } else {
+            let resolved: SocketAddr = target
+                .to_socket_addrs()
+                .with_context(|| format!("Resolve multiplayer server '{target}'"))?
+                .find(|a| a.is_ipv4())
+                .or_else(|| target.to_socket_addrs().ok()?.next())
+                .with_context(|| format!("No reachable address for '{target}'"))?;
 
-        let socket = UdpSocket::bind("0.0.0.0:0").context("Bind client UDP socket")?;
-        socket.set_nonblocking(true)?;
-        socket.connect(resolved)?;
+            let socket = UdpSocket::bind("0.0.0.0:0").context("Bind client UDP socket")?;
+            socket.set_nonblocking(true)?;
+            socket.connect(resolved)?;
+            (ClientTransport::Udp(socket), target.to_owned())
+        };
 
         let (tx, cmd_rx) = mpsc::channel();
         let (ev_tx, rx) = mpsc::channel();
-        let addr_str = server_addr.to_owned();
 
         let handle = thread::Builder::new()
             .name("blotworx-mp-client".into())
-            .spawn(move || client_loop(socket, username, level, cmd_rx, ev_tx))
+            .spawn(move || {
+                client_loop(transport, username, preferred_color, level, cmd_rx, ev_tx)
+            })
             .context("Spawn multiplayer client thread")?;
 
         Ok(Self {
             tx,
             rx,
-            server_addr: addr_str,
+            server_addr: display_target,
             handle: Some(handle),
         })
     }
@@ -573,6 +899,10 @@ impl NetClient {
         let _ = self.tx.send(ClientCmd::SendLevel(level));
     }
 
+    pub fn send_color(&self, color_slot: u8) {
+        let _ = self.tx.send(ClientCmd::SendColor(color_slot));
+    }
+
     pub fn poll_events(&self) -> Vec<ClientEvent> {
         let mut out = Vec::new();
         while let Ok(ev) = self.rx.try_recv() {
@@ -592,8 +922,9 @@ impl Drop for NetClient {
 }
 
 fn client_loop(
-    socket: UdpSocket,
+    mut transport: ClientTransport,
     username: String,
+    preferred_color: u8,
     initial_level: String,
     cmd_rx: mpsc::Receiver<ClientCmd>,
     ev_tx: mpsc::Sender<ClientEvent>,
@@ -601,12 +932,13 @@ fn client_loop(
     let join_pkt = Packet::JoinRequest {
         username: username.clone(),
         level: initial_level,
+        preferred_color,
     }
     .encode();
-    let _ = socket.send(&join_pkt);
+    let _ = transport.send(&join_pkt);
 
     let mut player_id: Option<u8> = None;
-    let mut color_slot: u8 = 0;
+    let mut color_slot: u8 = preferred_color;
     let mut seq: u32 = 0;
     let mut chat_seq: u32 = 0;
     let mut voice_seq: u16 = 0;
@@ -623,7 +955,7 @@ fn client_loop(
                 ClientCmd::Disconnect => {
                     if let Some(id) = player_id {
                         let bytes = Packet::Leave { player_id: id }.encode();
-                        let _ = socket.send(&bytes);
+                        let _ = transport.send(&bytes);
                     }
                     return;
                 }
@@ -633,7 +965,7 @@ fn client_loop(
                         state.id = id;
                         state.color_slot = color_slot;
                         let bytes = Packet::PlayerState { seq, state }.encode();
-                        let _ = socket.send(&bytes);
+                        let _ = transport.send(&bytes);
                     }
                 }
                 ClientCmd::SendChat(text) => {
@@ -647,9 +979,11 @@ fn client_loop(
                             text,
                         })
                         .encode();
-                        // Send twice to guard against single UDP drop (server deduplicates by (sender_id, msg_id))
-                        let _ = socket.send(&bytes);
-                        let _ = socket.send(&bytes);
+                        let _ = transport.send(&bytes);
+                        if transport.is_udp() {
+                            // Send twice on UDP to guard against single packet drop
+                            let _ = transport.send(&bytes);
+                        }
                     }
                 }
                 ClientCmd::SendVoice {
@@ -667,7 +1001,7 @@ fn client_loop(
                             ulaw,
                         }
                         .encode();
-                        let _ = socket.send(&bytes);
+                        let _ = transport.send(&bytes);
                     }
                 }
                 ClientCmd::SendLevel(level) => {
@@ -677,20 +1011,37 @@ fn client_loop(
                             level,
                         }
                         .encode();
-                        let _ = socket.send(&bytes);
+                        let _ = transport.send(&bytes);
+                    }
+                }
+                ClientCmd::SendColor(new_color) => {
+                    if let Some(id) = player_id {
+                        let bytes = Packet::ColorChange {
+                            player_id: id,
+                            color_slot: new_color,
+                        }
+                        .encode();
+                        let _ = transport.send(&bytes);
                     }
                 }
             }
         }
 
-        // Receive inbound UDP packets
-        let mut received_any = false;
-        while let Ok(len) = socket.recv(&mut buf) {
-            received_any = true;
+        // Receive inbound packets
+        let packets = match transport.poll(&mut buf) {
+            Ok(pkts) => pkts,
+            Err(e) => {
+                let _ = ev_tx.send(ClientEvent::Disconnected(format!(
+                    "Relay connection lost: {e}"
+                )));
+                return;
+            }
+        };
+        let received_any = !packets.is_empty();
+        if received_any {
             last_rx = Instant::now();
-            let Some(pkt) = Packet::decode(&buf[..len]) else {
-                continue;
-            };
+        }
+        for pkt in packets {
             match pkt {
                 Packet::JoinAccept {
                     player_id: pid,
@@ -717,6 +1068,11 @@ fn client_loop(
                     host_level,
                     players,
                 } => {
+                    if let Some(pid) = player_id {
+                        if let Some(me) = players.iter().find(|p| p.id == pid) {
+                            color_slot = me.color_slot;
+                        }
+                    }
                     let _ = ev_tx.send(ClientEvent::Roster {
                         host_level,
                         players,
@@ -751,13 +1107,16 @@ fn client_loop(
             if now.duration_since(last_join_retry) >= Duration::from_millis(600) {
                 last_join_retry = now;
                 join_attempts += 1;
-                if join_attempts > 10 {
-                    let _ = ev_tx.send(ClientEvent::Disconnected(
-                        "Connection timed out (host unreachable or firewall blocking UDP)".into(),
-                    ));
+                if join_attempts > 12 {
+                    let msg = if transport.is_udp() {
+                        "Connection timed out (host unreachable or firewall blocking UDP — use a Room Code instead for zero port forwarding!)"
+                    } else {
+                        "Room not found or host is not online (check the Room Code and make sure the host clicked Host Online Game)"
+                    };
+                    let _ = ev_tx.send(ClientEvent::Disconnected(msg.into()));
                     return;
                 }
-                let _ = socket.send(&join_pkt);
+                let _ = transport.send(&join_pkt);
             }
         } else {
             if now.duration_since(last_hb) >= Duration::from_millis(HEARTBEAT_INTERVAL_MS) {
@@ -766,7 +1125,7 @@ fn client_loop(
                     player_id: player_id.unwrap(),
                 }
                 .encode();
-                let _ = socket.send(&bytes);
+                let _ = transport.send(&bytes);
             }
             if now.duration_since(last_rx) > Duration::from_secs(TIMEOUT_SECS) {
                 let _ = ev_tx.send(ClientEvent::Disconnected(
@@ -794,7 +1153,7 @@ pub fn detect_lan_ip() -> String {
     "127.0.0.1".to_owned()
 }
 
-/// Non-blocking public IP lookup for convenient online invite sharing.
+/// Non-blocking public IP lookup for convenient LAN/direct invite sharing.
 pub fn spawn_public_ip_lookup() -> mpsc::Receiver<String> {
     let (tx, rx) = mpsc::channel();
     let _ = thread::Builder::new()
@@ -911,23 +1270,35 @@ mod tests {
 
     #[test]
     fn host_and_two_clients_get_unique_pants_colors_and_exchange_chat() {
-        let server = HostServer::start(0, "Levels/GV_ZoneA_Start.level".into()).unwrap();
-        let addr = format!("127.0.0.1:{}", server.bound_addr.port());
+        let server = HostServer::start_lan(0, "Levels/GV_ZoneA_Start.level".into()).unwrap();
+        let addr = format!("127.0.0.1:{}", server.bound_addr.unwrap().port());
 
-        // Intentionally use identical usernames to verify unique slot & color assignment
-        let c1 = NetClient::connect(&addr, "Mickey".into(), "Levels/GV_ZoneA_Start.level".into()).unwrap();
-        let c2 = NetClient::connect(&addr, "Mickey".into(), "Levels/GV_ZoneA_Start.level".into()).unwrap();
+        // Intentionally use identical usernames & chosen color 4 to verify unique slot & color assignment
+        let c1 = NetClient::connect(&addr, "Mickey".into(), 4, "Levels/GV_ZoneA_Start.level".into())
+            .unwrap();
+        let c2 = NetClient::connect(&addr, "Mickey".into(), 4, "Levels/GV_ZoneA_Start.level".into())
+            .unwrap();
 
         let mut j1 = None;
         let mut j2 = None;
         for _ in 0..40 {
             for ev in c1.poll_events() {
-                if let ClientEvent::Joined { player_id, color_slot, .. } = ev {
+                if let ClientEvent::Joined {
+                    player_id,
+                    color_slot,
+                    ..
+                } = ev
+                {
                     j1 = Some((player_id, color_slot));
                 }
             }
             for ev in c2.poll_events() {
-                if let ClientEvent::Joined { player_id, color_slot, .. } = ev {
+                if let ClientEvent::Joined {
+                    player_id,
+                    color_slot,
+                    ..
+                } = ev
+                {
                     j2 = Some((player_id, color_slot));
                 }
             }
@@ -940,22 +1311,24 @@ mod tests {
         let (id2, col2) = j2.expect("client 2 joined");
         assert_ne!(id1, id2);
         assert_ne!(col1, col2, "Every player must receive a unique pants color");
+        assert!(col1 == 4 || col2 == 4, "First joiner should get preferred color 4");
 
-        c1.send_chat("Hello from player 1!".into());
-        let mut got_chat = false;
+        // Test live color change
+        c2.send_color(9);
+        let mut switched = false;
         for _ in 0..40 {
-            for ev in c2.poll_events() {
-                if let ClientEvent::Chat(c) = ev {
-                    if c.text == "Hello from player 1!" && c.color_slot == col1 {
-                        got_chat = true;
+            for ev in c1.poll_events() {
+                if let ClientEvent::Roster { players, .. } = ev {
+                    if players.iter().any(|p| p.id == id2 && p.color_slot == 9) {
+                        switched = true;
                     }
                 }
             }
-            if got_chat {
+            if switched {
                 break;
             }
             thread::sleep(Duration::from_millis(25));
         }
-        assert!(got_chat, "client 2 should receive chat with sender's pants color");
+        assert!(switched, "client 2 should be able to switch pants color live");
     }
 }

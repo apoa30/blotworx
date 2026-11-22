@@ -216,18 +216,28 @@ pub fn parse_join_target(raw: &str) -> Option<String> {
 
 fn normalize_addr(addr: &str) -> String {
     let s = addr.trim();
-    if s.contains(':') {
+    if let Some(code) = s.strip_prefix("room:").or_else(|| s.strip_prefix("ROOM:")) {
+        return super::relay::normalize_room_code(code);
+    }
+    if super::relay::is_room_code_target(s) {
+        super::relay::normalize_room_code(s)
+    } else if s.contains(':') {
         s.to_owned()
     } else {
         format!("{s}:{}", super::protocol::DEFAULT_PORT)
     }
 }
 
-/// Build a friendly, ready-to-paste Discord invite message with clickable deep link + direct address.
+/// Build a friendly, ready-to-paste Discord invite message with clickable deep link + room code.
 pub fn format_discord_invite(addr: &str, level_label: &str, players: usize, max: usize) -> String {
+    let label = if super::relay::is_room_code_target(addr) {
+        "Room Code"
+    } else {
+        "Direct Join"
+    };
     format!(
         "Join my **Blotworx Online Multiplayer** lobby! ({players}/{max} players · {level_label})\n\
-         Direct Join: `{addr}`\n\
+         {label}: `{addr}`\n\
          Quick Link: <blotworx://join/{addr}>"
     )
 }

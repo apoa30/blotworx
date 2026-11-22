@@ -9,6 +9,7 @@ pub mod discord;
 pub mod net;
 pub mod pants;
 pub mod protocol;
+pub mod relay;
 pub mod voice;
 
 use crate::render_support::viewport3d::GpuDrawCommand;
@@ -24,7 +25,7 @@ use pants::{append_remote_player_draws, remote_player_matrix, PantsTextureCache}
 use protocol::{
     level_hash, pants_color, preferred_color_slot, sanitize_username, NetPlayerState,
     DEFAULT_PORT, FLAG_GROUNDED, FLAG_JUMPING, FLAG_SPEAKING, FLAG_SPINNING, FLAG_SPRAY_PAINT,
-    FLAG_SPRAY_THINNER, MAX_PLAYERS,
+    FLAG_SPRAY_THINNER, MAX_PLAYERS, PANTS_PALETTE,
 };
 use std::{
     collections::{HashSet, VecDeque},
@@ -46,13 +47,15 @@ struct ChatEntry {
 pub enum ConnectionState {
     Offline,
     Connecting(String),
-    Hosting { port: u16 },
+    HostingRoom { room_code: String, broker: String },
+    HostingLan { port: u16 },
     Connected { addr: String },
 }
 
 pub struct Multiplayer {
     pub panel_open: bool,
     pub username: String,
+    pub room_code_input: String,
     pub host_port: String,
     pub public_addr_override: String,
     pub join_input: String,
@@ -69,6 +72,7 @@ pub struct Multiplayer {
     server: Option<HostServer>,
     client: Option<NetClient>,
     local_id: Option<u8>,
+    chosen_color_slot: Option<u8>,
     local_color_slot: u8,
     session_id: String,
     host_level: String,
@@ -110,6 +114,7 @@ impl Multiplayer {
         let mut mp = Self {
             panel_open: false,
             username: default_name,
+            room_code_input: relay::generate_room_code(),
             host_port: DEFAULT_PORT.to_string(),
             public_addr_override: String::new(),
             join_input: auto_join.clone().unwrap_or_default(),
@@ -123,6 +128,7 @@ impl Multiplayer {
             server: None,
             client: None,
             local_id: None,
+            chosen_color_slot: None,
             local_color_slot: color,
             session_id: String::new(),
             host_level: initial_level.to_owned(),
@@ -167,8 +173,22 @@ impl Multiplayer {
     pub fn local_color_slot(&self) -> u8 {
         if self.local_id.is_some() {
             self.local_color_slot
+        } else if let Some(chosen) = self.chosen_color_slot {
+            chosen
         } else {
             preferred_color_slot(&self.username)
+        }
+    }
+
+    pub fn select_pants_color(&mut self, slot: Option<u8>) {
+        self.chosen_color_slot = slot.map(|s| s % (MAX_PLAYERS as u8));
+        let desired = self.chosen_color_slot.unwrap_or_else(|| preferred_color_slot(&self.username));
+        if self.local_id.is_some() {
+            if let Some(client) = &self.client {
+                client.send_color(desired);
+            }
+        } else {
+            self.local_color_slot = desired;
         }
     }
 
@@ -196,30 +216,43 @@ impl Multiplayer {
         self.pending_level_switch.take()
     }
 
+    /// Host an online lobby using a Room Code (zero port forwarding required — works over any NAT).
     pub fn host(&mut self) {
         self.disconnect();
-        let port = self
-            .host_port
-            .trim()
-            .parse::<u16>()
-            .unwrap_or(DEFAULT_PORT);
         let uname = sanitize_username(&self.username);
         self.username = uname.clone();
-        match HostServer::start(port, self.current_level.clone()) {
+        let desired_color = self.local_color_slot();
+        let raw_code = self.room_code_input.clone();
+        match HostServer::start_online(raw_code, self.current_level.clone()) {
             Ok(srv) => {
-                let bound_port = srv.bound_addr.port();
-                let local_addr = format!("127.0.0.1:{bound_port}");
+                let room_code = srv
+                    .room_code
+                    .clone()
+                    .unwrap_or_else(relay::generate_room_code);
+                let broker = srv
+                    .broker_addr
+                    .clone()
+                    .unwrap_or_else(|| "online relay".to_owned());
+                self.room_code_input = room_code.clone();
                 self.session_id = srv.session_id.clone();
-                match NetClient::connect(&local_addr, uname, self.current_level.clone()) {
+                match NetClient::connect(
+                    &room_code,
+                    uname,
+                    desired_color,
+                    self.current_level.clone(),
+                ) {
                     Ok(cli) => {
                         self.server = Some(srv);
                         self.client = Some(cli);
-                        self.state = ConnectionState::Hosting { port: bound_port };
+                        self.state = ConnectionState::HostingRoom {
+                            room_code: room_code.clone(),
+                            broker,
+                        };
                         self.last_error = None;
                         self.push_system_chat(format!(
-                            "Hosting online lobby on UDP port {bound_port} (up to {MAX_PLAYERS} players)."
+                            "Hosting online room {room_code} (up to {MAX_PLAYERS} players, no port forwarding needed!)."
                         ));
-                        self.set_notice(format!("Hosting on port {bound_port}"));
+                        self.set_notice(format!("Hosting room {room_code} — share this code or Discord invite!"));
                         self.sync_discord_presence();
                     }
                     Err(e) => {
@@ -228,26 +261,76 @@ impl Multiplayer {
                 }
             }
             Err(e) => {
-                self.last_error = Some(format!("Failed to host on port {port}: {e:#}"));
+                self.last_error = Some(format!(
+                    "Failed to connect to online relay: {e:#}. You can still use Direct LAN (UDP) below."
+                ));
+            }
+        }
+    }
+
+    /// Host a direct LAN UDP server on the configured port (optional fallback for local networks).
+    pub fn host_lan(&mut self) {
+        self.disconnect();
+        let port = self
+            .host_port
+            .trim()
+            .parse::<u16>()
+            .unwrap_or(DEFAULT_PORT);
+        let uname = sanitize_username(&self.username);
+        self.username = uname.clone();
+        let desired_color = self.local_color_slot();
+        match HostServer::start_lan(port, self.current_level.clone()) {
+            Ok(srv) => {
+                let bound_port = srv.bound_addr.map(|a| a.port()).unwrap_or(port);
+                let local_addr = format!("127.0.0.1:{bound_port}");
+                self.session_id = srv.session_id.clone();
+                match NetClient::connect(
+                    &local_addr,
+                    uname,
+                    desired_color,
+                    self.current_level.clone(),
+                ) {
+                    Ok(cli) => {
+                        self.server = Some(srv);
+                        self.client = Some(cli);
+                        self.state = ConnectionState::HostingLan { port: bound_port };
+                        self.last_error = None;
+                        self.push_system_chat(format!(
+                            "Hosting Direct LAN lobby on UDP port {bound_port} (up to {MAX_PLAYERS} players)."
+                        ));
+                        self.set_notice(format!("Hosting Direct LAN on port {bound_port}"));
+                        self.sync_discord_presence();
+                    }
+                    Err(e) => {
+                        self.last_error = Some(format!("Local host client failed: {e:#}"));
+                    }
+                }
+            }
+            Err(e) => {
+                self.last_error = Some(format!("Failed to host LAN on port {port}: {e:#}"));
             }
         }
     }
 
     pub fn join(&mut self, raw_target: &str) {
         let Some(addr) = parse_join_target(raw_target) else {
-            self.last_error = Some("Enter a server address (e.g. 192.168.1.50:27077) or Discord invite link.".into());
+            self.last_error = Some(
+                "Enter a Room Code (e.g. BLOT-7K3P), Discord invite link, or LAN IP:Port.".into(),
+            );
             return;
         };
         self.disconnect();
         let uname = sanitize_username(&self.username);
         self.username = uname.clone();
-        match NetClient::connect(&addr, uname, self.current_level.clone()) {
+        let desired_color = self.local_color_slot();
+        match NetClient::connect(&addr, uname, desired_color, self.current_level.clone()) {
             Ok(cli) => {
+                let display = cli.server_addr.clone();
                 self.client = Some(cli);
-                self.state = ConnectionState::Connecting(addr.clone());
+                self.state = ConnectionState::Connecting(display.clone());
                 self.last_error = None;
-                self.push_system_chat(format!("Connecting to {addr}..."));
-                self.set_notice(format!("Connecting to {addr}..."));
+                self.push_system_chat(format!("Connecting to {display}..."));
+                self.set_notice(format!("Connecting to {display}..."));
             }
             Err(e) => {
                 self.last_error = Some(format!("Could not connect to {addr}: {e:#}"));
@@ -272,7 +355,8 @@ impl Multiplayer {
 
     fn invite_address(&self) -> Option<String> {
         match &self.state {
-            ConnectionState::Hosting { port } => {
+            ConnectionState::HostingRoom { room_code, .. } => Some(room_code.clone()),
+            ConnectionState::HostingLan { port } => {
                 let ov = self.public_addr_override.trim();
                 if !ov.is_empty() {
                     return Some(if ov.contains(':') {
@@ -599,25 +683,30 @@ impl Multiplayer {
         world: &super::assets::World,
         draws: &mut Vec<GpuDrawCommand>,
     ) {
-        if !self.is_online() {
+        let online = self.is_online();
+        if !online && self.chosen_color_slot.is_none() {
             return;
         }
         let local_color = self.local_color_slot();
         // Snapshot the unmodified skinned Mickey draws before recoloring local Mickey
-        let base_mickey: Vec<GpuDrawCommand> = world
-            .player_draws
-            .iter()
-            .filter_map(|&idx| draws.get(idx).cloned())
-            .collect();
+        let base_mickey: Vec<GpuDrawCommand> = if online {
+            world
+                .player_draws
+                .iter()
+                .filter_map(|&idx| draws.get(idx).cloned())
+                .collect()
+        } else {
+            Vec::new()
+        };
 
-        // Recolor local player's pants to match their assigned unique color slot
+        // Recolor local player's pants to match their chosen or assigned unique color slot
         for &idx in &world.player_draws {
             if let Some(d) = draws.get_mut(idx) {
                 self.pants_cache.apply_to_draw(d, local_color);
             }
         }
 
-        if base_mickey.is_empty() {
+        if !online || base_mickey.is_empty() {
             return;
         }
         let my_level_hash = level_hash(&self.current_level);
@@ -779,14 +868,28 @@ impl Multiplayer {
                         ui.horizontal(|ui| {
                             if self.is_online() {
                                 let pcol = pants_color(self.local_color_slot());
-                                ui.colored_label(
-                                    pcol.text_color(),
-                                    format!(
+                                let status_lbl = match &self.state {
+                                    ConnectionState::HostingRoom { room_code, .. } => format!(
+                                        "● {room_code} · {}/{}",
+                                        self.player_count(),
+                                        MAX_PLAYERS
+                                    ),
+                                    ConnectionState::Connected { addr }
+                                        if relay::is_room_code_target(addr) =>
+                                    {
+                                        format!(
+                                            "● {addr} · {}/{}",
+                                            self.player_count(),
+                                            MAX_PLAYERS
+                                        )
+                                    }
+                                    _ => format!(
                                         "● ONLINE {}/{}",
                                         self.player_count(),
                                         MAX_PLAYERS
                                     ),
-                                );
+                                };
+                                ui.colored_label(pcol.text_color(), status_lbl);
                                 if self.voice_settings.enabled {
                                     let (v_lbl, v_col) = if self.voice_settings.mic_muted {
                                         ("MIC MUTED", egui::Color32::from_rgb(220, 90, 90))
@@ -978,9 +1081,10 @@ impl Multiplayer {
 
     /// Reusable lobby UI (shown in both `F9` window and `F10 -> Multiplayer` options tab).
     pub fn draw_lobby_contents(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        let my_color = pants_color(self.local_color_slot());
+        let my_slot = self.local_color_slot();
+        let my_color = pants_color(my_slot);
 
-        // 1. Player Profile & Unique Pants Color preview
+        // 1. Player Profile & Interactive 16-Color Pants Picker
         ui.horizontal_wrapped(|ui| {
             ui.strong("Username:");
             let edit = ui.add_enabled(
@@ -989,7 +1093,7 @@ impl Multiplayer {
                     .desired_width(160.0)
                     .char_limit(24),
             );
-            if edit.changed() && !self.is_online() {
+            if edit.changed() && !self.is_online() && self.chosen_color_slot.is_none() {
                 self.local_color_slot = preferred_color_slot(&self.username);
             }
             let (swatch_rect, _) =
@@ -999,10 +1103,80 @@ impl Multiplayer {
             ui.painter().rect_stroke(
                 swatch_rect,
                 4.0,
-                egui::Stroke::new(1.0, egui::Color32::WHITE),
+                egui::Stroke::new(1.2, egui::Color32::WHITE),
                 egui::StrokeKind::Inside,
             );
             ui.colored_label(my_color.text_color(), format!("{} Pants", my_color.name));
+        });
+
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Pants Color:");
+            ui.spacing_mut().item_spacing.x = 4.0;
+            let mut picked_slot: Option<Option<u8>> = None;
+            for (idx, pcol) in PANTS_PALETTE.iter().enumerate() {
+                let slot = idx as u8;
+                let taken_by = self
+                    .remotes
+                    .values()
+                    .find(|rp| rp.info.color_slot == slot)
+                    .map(|rp| rp.info.username.clone());
+                let is_selected = my_slot == slot;
+                let sense = if taken_by.is_some() {
+                    egui::Sense::hover()
+                } else {
+                    egui::Sense::click()
+                };
+                let (rect, resp) = ui.allocate_exact_size(egui::vec2(20.0, 20.0), sense);
+                let fill = if taken_by.is_some() {
+                    let c = pcol.egui_color();
+                    egui::Color32::from_rgba_unmultiplied(c.r() / 2, c.g() / 2, c.b() / 2, 160)
+                } else {
+                    pcol.egui_color()
+                };
+                ui.painter().rect_filled(rect, 4.0, fill);
+                if is_selected {
+                    ui.painter().rect_stroke(
+                        rect,
+                        4.0,
+                        egui::Stroke::new(2.2, egui::Color32::WHITE),
+                        egui::StrokeKind::Inside,
+                    );
+                } else if resp.hovered() && taken_by.is_none() {
+                    ui.painter().rect_stroke(
+                        rect,
+                        4.0,
+                        egui::Stroke::new(1.4, egui::Color32::from_gray(220)),
+                        egui::StrokeKind::Inside,
+                    );
+                } else if taken_by.is_some() {
+                    // Draw small diagonal slash indicating taken by another player
+                    ui.painter().line_segment(
+                        [rect.left_bottom(), rect.right_top()],
+                        egui::Stroke::new(1.5, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 140)),
+                    );
+                }
+                let tip = if let Some(owner) = &taken_by {
+                    format!("{} (Taken by {owner})", pcol.name)
+                } else if is_selected {
+                    format!("{} (Selected)", pcol.name)
+                } else {
+                    format!("Choose {} Pants", pcol.name)
+                };
+                if resp.on_hover_text(tip).clicked() && taken_by.is_none() {
+                    picked_slot = Some(Some(slot));
+                }
+            }
+            if !self.is_online()
+                && ui
+                    .small_button("Auto")
+                    .on_hover_text("Auto-pick pants color from your username")
+                    .clicked()
+            {
+                picked_slot = Some(None);
+            }
+            if let Some(choice) = picked_slot {
+                self.select_pants_color(choice);
+            }
         });
 
         if let Some(err) = &self.last_error {
@@ -1016,47 +1190,83 @@ impl Multiplayer {
 
         ui.separator();
 
-        // 2. Host / Join Controls
+        // 2. Host / Join Controls (Zero-Port-Forwarding Online Room Code by Default)
         if !self.is_online() {
             ui.columns(2, |cols| {
-                cols[0].strong("Host Online Lobby (up to 16)");
+                cols[0].strong("Host Online Lobby (No Port Forwarding)");
                 cols[0].horizontal(|ui| {
-                    ui.label("UDP Port:");
-                    ui.add(egui::TextEdit::singleline(&mut self.host_port).desired_width(72.0));
-                });
-                cols[0].horizontal(|ui| {
-                    ui.label("Public Address:");
+                    ui.label("Room Code:");
                     ui.add(
-                        egui::TextEdit::singleline(&mut self.public_addr_override)
-                            .desired_width(150.0)
-                            .hint_text(self.public_ip.as_deref().unwrap_or(&self.lan_ip)),
+                        egui::TextEdit::singleline(&mut self.room_code_input)
+                            .desired_width(110.0)
+                            .char_limit(20),
                     );
+                    if ui
+                        .small_button("New")
+                        .on_hover_text("Generate a fresh random Room Code")
+                        .clicked()
+                    {
+                        self.room_code_input = relay::generate_room_code();
+                    }
                 });
-                if cols[0].button("Host Online Game").clicked() {
+                if cols[0].button("Host Online Game (Up to 16)").clicked() {
                     self.host();
                 }
-                cols[0].weak(format!("LAN IP: {}", self.lan_ip));
+                cols[0].weak("Works over the internet with zero router setup!");
 
                 cols[1].strong("Join Online Lobby");
                 cols[1].add(
                     egui::TextEdit::singleline(&mut self.join_input)
                         .desired_width(220.0)
-                        .hint_text("IP:Port or blotworx://join/..."),
+                        .hint_text("Room Code (BLOT-XXXX) or Discord invite"),
                 );
-                if cols[1].button("Connect").clicked() {
+                if cols[1].button("Join Game").clicked() {
                     let target = self.join_input.clone();
                     self.join(&target);
                 }
-                cols[1].weak("Paste an IP:Port or Discord invite message.");
+                cols[1].weak("Paste a Room Code, Discord invite, or LAN IP:Port.");
+            });
+
+            ui.collapsing("Advanced: Direct LAN Host (UDP)", |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("UDP Port:");
+                    ui.add(egui::TextEdit::singleline(&mut self.host_port).desired_width(68.0));
+                    ui.label("Public Override:");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.public_addr_override)
+                            .desired_width(135.0)
+                            .hint_text(self.public_ip.as_deref().unwrap_or(&self.lan_ip)),
+                    );
+                    if ui.button("Host Direct LAN").clicked() {
+                        self.host_lan();
+                    }
+                });
+                ui.weak(format!(
+                    "LAN IP: {} (Direct UDP only needs port forwarding for internet play; use Online Room Code above instead!)",
+                    self.lan_ip
+                ));
             });
         } else {
             ui.horizontal_wrapped(|ui| {
                 match &self.state {
-                    ConnectionState::Hosting { port } => {
+                    ConnectionState::HostingRoom { room_code, .. } => {
                         ui.colored_label(
                             egui::Color32::from_rgb(100, 235, 145),
                             format!(
-                                "Hosting Lobby ({}/{MAX_PLAYERS}) · UDP :{port}",
+                                "Hosting Room {room_code} ({}/{MAX_PLAYERS})",
+                                self.player_count()
+                            ),
+                        );
+                        if ui.button("Copy Room Code").clicked() {
+                            ctx.copy_text(room_code.clone());
+                            self.set_notice(format!("Copied Room Code {room_code} to clipboard!"));
+                        }
+                    }
+                    ConnectionState::HostingLan { port } => {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(100, 235, 145),
+                            format!(
+                                "Hosting LAN ({}/{MAX_PLAYERS}) · UDP :{port}",
                                 self.player_count()
                             ),
                         );
@@ -1069,6 +1279,10 @@ impl Multiplayer {
                                 self.player_count()
                             ),
                         );
+                        if ui.button("Copy Room Code").clicked() {
+                            ctx.copy_text(addr.clone());
+                            self.set_notice(format!("Copied {addr} to clipboard!"));
+                        }
                     }
                     ConnectionState::Connecting(addr) => {
                         ui.colored_label(
@@ -1077,6 +1291,18 @@ impl Multiplayer {
                         );
                     }
                     ConnectionState::Offline => {}
+                }
+                if let Some(addr) = self.invite_address() {
+                    if ui.button("Copy Discord Invite").clicked() {
+                        let invite_text = format_discord_invite(
+                            &addr,
+                            &Self::pretty_level_name(&self.current_level),
+                            self.player_count(),
+                            MAX_PLAYERS,
+                        );
+                        ctx.copy_text(invite_text);
+                        self.set_notice("Copied Discord invite to clipboard!".into());
+                    }
                 }
                 if ui.button("Disconnect").clicked() {
                     self.disconnect();

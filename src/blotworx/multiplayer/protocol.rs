@@ -126,6 +126,7 @@ pub enum Packet {
     JoinRequest {
         username: String,
         level: String,
+        preferred_color: u8, // 0..15 or 255 = auto from username
     },
     JoinAccept {
         player_id: u8,
@@ -167,6 +168,10 @@ pub enum Packet {
     Heartbeat {
         player_id: u8,
     },
+    ColorChange {
+        player_id: u8,
+        color_slot: u8,
+    },
 }
 
 const TAG_JOIN_REQ: u8 = 1;
@@ -180,6 +185,7 @@ const TAG_CHAT: u8 = 8;
 const TAG_VOICE: u8 = 9;
 const TAG_LEVEL_CHANGE: u8 = 10;
 const TAG_HEARTBEAT: u8 = 11;
+const TAG_COLOR_CHANGE: u8 = 12;
 
 fn put_u8(out: &mut Vec<u8>, v: u8) {
     out.push(v);
@@ -280,10 +286,15 @@ impl Packet {
         out.extend_from_slice(PROTOCOL_MAGIC);
         put_u8(&mut out, PROTOCOL_VERSION);
         match self {
-            Packet::JoinRequest { username, level } => {
+            Packet::JoinRequest {
+                username,
+                level,
+                preferred_color,
+            } => {
                 put_u8(&mut out, TAG_JOIN_REQ);
                 put_str(&mut out, username);
                 put_str(&mut out, level);
+                put_u8(&mut out, *preferred_color);
             }
             Packet::JoinAccept {
                 player_id,
@@ -369,6 +380,14 @@ impl Packet {
                 put_u8(&mut out, TAG_HEARTBEAT);
                 put_u8(&mut out, *player_id);
             }
+            Packet::ColorChange {
+                player_id,
+                color_slot,
+            } => {
+                put_u8(&mut out, TAG_COLOR_CHANGE);
+                put_u8(&mut out, *player_id);
+                put_u8(&mut out, *color_slot);
+            }
         }
         out
     }
@@ -385,6 +404,7 @@ impl Packet {
             TAG_JOIN_REQ => Some(Packet::JoinRequest {
                 username: r.str()?,
                 level: r.str()?,
+                preferred_color: r.u8().unwrap_or(255),
             }),
             TAG_JOIN_ACCEPT => {
                 let player_id = r.u8()?;
@@ -458,6 +478,10 @@ impl Packet {
                 level: r.str()?,
             }),
             TAG_HEARTBEAT => Some(Packet::Heartbeat { player_id: r.u8()? }),
+            TAG_COLOR_CHANGE => Some(Packet::ColorChange {
+                player_id: r.u8()?,
+                color_slot: r.u8()?,
+            }),
             _ => None,
         }
     }
@@ -473,6 +497,11 @@ mod tests {
             Packet::JoinRequest {
                 username: "Oswald".into(),
                 level: "Levels/GV_ZoneA_Start.level".into(),
+                preferred_color: 5,
+            },
+            Packet::ColorChange {
+                player_id: 3,
+                color_slot: 11,
             },
             Packet::JoinAccept {
                 player_id: 3,
