@@ -288,7 +288,7 @@ static void build_builtin_fallback_level(void) {
     g_hdr.version = BW3D_VERSION;
     strncpy(g_hdr.title, "GV_ZoneA_Start (Built-in 3DS Showcase)", sizeof(g_hdr.title) - 1);
     g_hdr.spawn_pos[0] = 0.0f; g_hdr.spawn_pos[1] = 0.5f; g_hdr.spawn_pos[2] = 14.0f;
-    g_hdr.spawn_yaw = 3.14159265f;
+    g_hdr.spawn_yaw = 0.0f;
     g_hdr.sky_rgba[0] = 24; g_hdr.sky_rgba[1] = 34; g_hdr.sky_rgba[2] = 58; g_hdr.sky_rgba[3] = 255;
 
     g_hdr.num_submeshes = 7;
