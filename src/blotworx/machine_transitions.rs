@@ -90,10 +90,6 @@ impl<H> Stack<H> {
             runtime.active,
             "Cannot start transition on an inactive machine"
         );
-        ensure!(
-            transition.flags & 8192 == 0,
-            "Nested destination routing must precede transition start"
-        );
         let target = generator(machine, transition.to_state_id)?;
         let maximum = machine.settings.max_simultaneous_transitions;
         ensure!(

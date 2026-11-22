@@ -141,8 +141,14 @@ enum AttackPhase {
 }
 impl World {
     pub(super) fn uses_demo_combat(&self, actor: usize, kind: &str) -> bool {
-        let kind = kind.to_ascii_lowercase();
-        kind.contains("spatter") || kind.contains("fodder") || kind.contains("kamikaze")
+        let low = kind.to_ascii_lowercase();
+        super::boss_ai::BossKind::of(kind).is_some()
+            || low.contains("spatter")
+            || low.contains("fodder")
+            || low.contains("kamikaze")
+            || low.contains("beetleworx")
+            || low.contains("theblob")
+            || low.contains("slobber")
             || (self.music_team(actor).is_some_and(|(team, _)| team == 2 || team == 3)
                 && self.entities[actor].components.iter().any(|c| c.class_name == "ArsenalComponent"))
     }
@@ -949,7 +955,7 @@ impl World {
         let shape = self.character_physics.get(&entity).and_then(|body| body.as_ref().ok()).map(|body| body.shape);
         self.demo_story.ai.detonations.insert(entity, true);
         let mut pending = BTreeMap::<usize, Vec<Emission>>::new();
-        for (stimulus, amount, radius) in stimuli {
+        for &(stimulus, amount, radius) in &stimuli {
             for target in self.area_stimulus_recipients(source, radius, Some(entity))? {
                 if target == entity { continue; }
                 let Some(position) = self.entity_position_or_bound_center(target)? else { continue; };
@@ -965,12 +971,26 @@ impl World {
                 });
             }
         }
+        // Retail Spladoosh CSG thinning (Spatter_TimeBeforeExplodeCausesCSG):
+        // if the explosion carries thinner stimulus (0), thin overlapped paintable jigsaw geometry.
+        if let Some(&(_, _, thin_radius)) = stimuli.iter().find(|&&(k, _, _)| k == 0) {
+            if let Ok(overlaps) = self.collision.overlap_sphere(source, thin_radius) {
+                let owners = overlaps
+                    .into_iter()
+                    .map(|hit| hit.owner)
+                    .collect::<std::collections::BTreeSet<_>>();
+                for owner in owners {
+                    let _ = self.brush_jigsaw_contact(owner, false);
+                }
+            }
+        }
         for (target, emissions) in pending {
             self.receive_combat(target, &emissions)?;
         }
         self.emit_entity_output(entity, "OnExplode", entity);
         if retire {
             self.emit_entity_output(entity, "OnDeath", entity);
+            self.emit_entity_output(entity, "OnDefeated", entity);
             self.queue_entity_retirement(entity)?;
         }
         Ok(())
@@ -1262,6 +1282,17 @@ impl World {
             let attacking = self.demo_story.ai.attacking.contains_key(&entity);
             let walk_attack = family == "beetleworxcrawler"
                 && self.authored_havok.has_event(entity, "EVENT_WalkAttack_Start");
+            if self.advance_story_boss(
+                entity,
+                paused,
+                dead,
+                shape,
+                source,
+                player_position,
+                delta,
+            )? {
+                continue;
+            }
             if self.advance_blob_vacuum(entity, sees_player && !attacking, paused || dead,
                 shape, source, player_position, facing)?
             {

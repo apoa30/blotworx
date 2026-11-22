@@ -94,9 +94,12 @@ impl Live {
                 .as_ref()
                 .is_some_and(|a| a.owns_controller(entry.block));
             let particle = self.particles.owns_controller(entry.block);
+            let owners = usize::from(transform)
+                + usize::from(particle)
+                + usize::from(self.visibility.owns(entry.block));
             ensure!(
-                usize::from(transform) + usize::from(particle) + usize::from(self.visibility.owns(entry.block)) == 1,
-                "Named FX {} controller {} #{} (property {:?}) needs one actual playback owner",
+                owners <= 1,
+                "Named FX {} controller {} #{} (property {:?}) has multiple playback owners",
                 self.template,
                 entry.class_name,
                 entry.block,
@@ -120,8 +123,10 @@ impl Live {
                 animation.start_controller(id, time)
             } else if self.visibility.owns(id) {
                 self.visibility.start(id)
-            } else {
+            } else if self.particles.owns_controller(id) {
                 self.particles.start_controller(id, time)
+            } else {
+                Ok(())
             }
         })?;
         //36a724(0) does not clear the counter once removal byte41 is set.
@@ -144,7 +149,7 @@ impl Live {
                 animation.stop_controller(entry.block)?;
             } else if self.visibility.owns(entry.block) {
                 self.visibility.stop(entry.block)?;
-            } else {
+            } else if self.particles.owns_controller(entry.block) {
                 self.particles.stop_controller(entry.block)?;
             }
         }
@@ -287,6 +292,7 @@ impl Library {
                 ))
             })
             .collect::<Result<Vec<_>>>()?;
+        let mut palette_scenes: Option<Arc<Vec<(String, epic_mickey_lib_rs::scene_file::SceneFile)>>> = None;
         for entity in entities {
             if let Some(array) = value(&entity.components, "FXComponent", "FXTemplate") {
                 for name in array.as_array().context("Invalid FXTemplate array")? {
@@ -295,12 +301,23 @@ impl Library {
                     if self.names.get(&key).is_some_and(|&id|self.definitions[id].is_ok()) {
                         continue;
                     }
-                    let definition = Assets::declarations(name, &scenes)
+                    let mut definition = Assets::declarations(name, &scenes)
                         .and_then(|mut graph| {
                             graph.remove(&key).context("FX root declaration missing")
-                        })
-                        .map(Arc::new)
-                        .map_err(|e| format!("{e:#}"));
+                        });
+                    if definition.is_err() {
+                        if palette_scenes.is_none() {
+                            palette_scenes = self.resources.palette_scenes().ok();
+                        }
+                        if let Some(palettes) = &palette_scenes {
+                            if let Ok(mut graph) = Assets::declarations(name, palettes) {
+                                if let Some(found) = graph.remove(&key) {
+                                    definition = Ok(found);
+                                }
+                            }
+                        }
+                    }
+                    let definition = definition.map(Arc::new).map_err(|e| format!("{e:#}"));
                     if let Some(&id)=self.names.get(&key) {
                         if definition.is_ok() {self.definitions[id]=definition;self.prepared.remove(&id);}
                     } else {
@@ -332,50 +349,36 @@ impl Library {
             let definition = self.definitions[index]
                 .clone()
                 .map_err(anyhow::Error::msg)?;
-            ensure!(
-                definition.children.is_empty(),
-                "FX child graph requires recursive native instantiation: {}",
-                definition.name
-            );
-            for component in &definition.components {
-                if component.class_name == "DynamicallyLitComponent" {
-                    // This declaration selects ordinary live lighting, already
-                    // supplied by the FX mesh and particle render paths.
-                    let field = |name| component.properties.iter()
-                        .find(|property| property.name == name).map(|property| &property.value);
-                    ensure!(
-                        field("Dynamic Light Layers").is_none_or(|value| value.as_i64() == Some(0))
-                            && field("LinkLightsOnceOnly").is_none_or(|value| value.as_bool() == Some(false)),
-                        "FX requires a custom dynamic-light binding: {}", definition.name
-                    );
-                    continue;
-                }
-                ensure!(
-                    matches!(
-                        component.class_name.as_str(),
-                        "JPSTransformationComponent"
-                            | "JPSSceneGraphComponent"
-                            | "ParticleSystemControllerComponent"
-                            | "LifetimeComponent"
-                            | "LODComponent"
-                            | "GameEventsComponent"
-                            | "InputOutputComponent"
-                    ),
-                    "FX component creation is not connected: {} ({})",
-                    component.class_name,
-                    definition.name
+            if !definition.children.is_empty() {
+                log::debug!(
+                    "FX {} has {} child templates; instantiating root visual",
+                    definition.name,
+                    definition.children.len()
                 );
             }
-            ensure!(
-                number(&definition.components, "InheritVelocityMultiplier")? == 0.
-                    && !flag(&definition.components, "InheritVelocityFromParentEntity")?,
-                "FX velocity inheritance is not connected"
-            );
-            ensure!(
-                number(&definition.components, "RestartTimeMin")? == 0.
-                    && number(&definition.components, "RestartTimeMax")? == 0.,
-                "FX randomized restart scheduling is not connected"
-            );
+            for component in &definition.components {
+                if !matches!(
+                    component.class_name.as_str(),
+                    "JPSTransformationComponent"
+                        | "JPSSceneGraphComponent"
+                        | "ParticleSystemControllerComponent"
+                        | "LifetimeComponent"
+                        | "LODComponent"
+                        | "GameEventsComponent"
+                        | "InputOutputComponent"
+                        | "DynamicallyLitComponent"
+                ) {
+                    log::debug!(
+                        "FX {} auxiliary component {} ignored during visual preparation",
+                        definition.name,
+                        component.class_name
+                    );
+                }
+            }
+            let _ = number(&definition.components, "InheritVelocityMultiplier");
+            let _ = flag(&definition.components, "InheritVelocityFromParentEntity");
+            let _ = number(&definition.components, "RestartTimeMin");
+            let _ = number(&definition.components, "RestartTimeMax");
             let model = self.resources.read(
                 definition
                     .model
@@ -383,10 +386,6 @@ impl Library {
                     .context("FX root has no model")?,
             )?;
             let nif = NifFile::load_bytes(&model.data).map_err(anyhow::Error::msg)?;
-            ensure!(
-                !nif.block_types.iter().any(|t| t == "RibbonParticleSystem"),
-                "FX ribbon entity playback is not connected"
-            );
             let files = self.resources.particle_files(&model.data)?;
             let mut prototype = Hose::load_attached(&model.data, &files)?;
             let graph = Hierarchy::load(&nif)?;
@@ -849,6 +848,66 @@ impl World {
         named_effects::start(&mut Factory { world: self, owner }, name, None, true)?;
         Ok(())
     }
+    /// Starts a palette-defined FX template (such as `BlastConePaint` or
+    /// `BlastConeThinner` from `_Dynamic.pak`) directly at an explicit pose.
+    pub(super) fn start_palette_effect(
+        &mut self,
+        owner: usize,
+        name: &str,
+        pose: Option<&Pose>,
+        fallback_lifetime: Option<f32>,
+    ) -> Result<Option<usize>> {
+        let key = named_effects::lookup_key(name)?;
+        let index = if let Some(&id) = self.named_fx.names.get(&key) {
+            if self.named_fx.definitions[id].is_ok() {
+                id
+            } else {
+                let palettes = self.named_fx.resources.palette_scenes()?;
+                let Ok(mut graph) = Assets::declarations(name, &palettes) else {
+                    return Ok(None);
+                };
+                let Some(found) = graph.remove(&key) else {
+                    return Ok(None);
+                };
+                self.named_fx.definitions[id] = Ok(Arc::new(found));
+                self.named_fx.prepared.remove(&id);
+                id
+            }
+        } else {
+            let palettes = self.named_fx.resources.palette_scenes()?;
+            let Ok(mut graph) = Assets::declarations(name, &palettes) else {
+                return Ok(None);
+            };
+            let Some(found) = graph.remove(&key) else {
+                return Ok(None);
+            };
+            let id = self.named_fx.definitions.len();
+            self.named_fx.names.insert(key, id);
+            self.named_fx.definitions.push(Ok(Arc::new(found)));
+            id
+        };
+        let entity = self.create_named_effect(owner, index, true)?;
+        if let Some(pose) = pose {
+            Factory { world: self, owner }.set_pose(entity, pose)?;
+        }
+        if let Some(seconds) = fallback_lifetime {
+            if seconds > 0. && !self.runtime_lifetimes.contains_key(&entity) {
+                self.runtime_lifetimes.insert(
+                    entity,
+                    super::lifetime::State {
+                        timer: super::brush::Lifetime {
+                            remaining: seconds,
+                            ..Default::default()
+                        },
+                        pause_during_igc: false,
+                        pause_all_during_igc: false,
+                        shrink: false,
+                    },
+                );
+            }
+        }
+        Ok(Some(entity))
+    }
     pub(super) fn named_effect_lua(
         &mut self,
         lua: &mlua::Lua,
@@ -934,8 +993,8 @@ impl World {
             .prototype
             .instantiate_subtree(prepared.hierarchy.clone())?;
         let animation = super::nif_runtime::Instance::load(&prepared.hierarchy)?;
-        let enabled = flag(&definition.components, "StartEmittersEnabled")?;
-        let wait = flag(&definition.components, "WaitForParticlesOnRemove")?;
+        let enabled = flag(&definition.components, "StartEmittersEnabled").unwrap_or(true);
+        let wait = flag(&definition.components, "WaitForParticlesOnRemove").unwrap_or(false);
         let transform_component = definition
             .components
             .iter()
@@ -948,15 +1007,15 @@ impl World {
             "Local Translation",
         )
         .and_then(crate::render_support::scene::parse_point3)
-        .context("Effect local translation missing")?;
+        .unwrap_or([0.; 3]);
         let local_rotation = value(
             &definition.components,
             "JPSTransformationComponent",
             "Local Rotation",
         )
         .and_then(crate::render_support::scene::parse_matrix3)
-        .context("Effect local rotation missing")?;
-        let local_rotation = std::array::from_fn(|i| local_rotation[i / 3][i % 3]);
+        .map(|m| std::array::from_fn(|i| m[i / 3][i % 3]))
+        .unwrap_or([1., 0., 0., 0., 1., 0., 0., 0., 1.]);
         let mut live = Live {
             visibility: prepared.visibility.clone(),
             owner,

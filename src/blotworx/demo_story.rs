@@ -986,6 +986,13 @@ impl super::assets::World {
                 end
             "#)?;
         }
+        if self.report.level.eq_ignore_ascii_case("Levels/PotW_JollyRoger_Start.Level") {
+            self.scripts.ensure_global_module("@jolly-roger-direct-entry.lua", br#"
+                if not rawget(_G, 'StartPetePanWander') then
+                    rawset(_G, 'StartPetePanWander', function() end)
+                end
+            "#)?;
+        }
         self.demo_story.enabled = true;
         self.demo_story.npc_fallback.enabled = true;
         let limitation="Temporary NPC fallback: verified scripted/conversation events and task waits with provisional Gremlin patrol/navigation and immediate action draining. Damage reactions, attraction/follow policies and full native navigation remain incomplete. Use --strict-npc-ai to disable this fallback.";
@@ -1415,7 +1422,15 @@ impl super::assets::World {
         self.cancel_inactive_story();
         if self.demo_story.active.is_none() {
             self.story_sequences.queue.retain(|request|!self.removed_entities.contains(&request.entity));
-            let next=self.story_sequences.queue.iter().position(|request|self.entity_scene_active(request.entity));
+            let player_midair_jump = self.script_player_available
+                && !self.script_player.grounded
+                && !self.script_player.stairs_ground_retained
+                && self.script_player.jump_stage.is_some();
+            let next=self.story_sequences.queue.iter().position(|request|{
+                self.entity_scene_active(request.entity)
+                    && (!player_midair_jump
+                        || self.story_sequences.resources.get(request.resource).is_none_or(|r| r.flags & 1 == 0))
+            });
             if let Some(request)=next.and_then(|index|self.story_sequences.queue.remove(index)) {
                 let resource = &self.story_sequences.resources[request.resource];
                 let node = sequence(&resource.bytes, &resource.path)?;

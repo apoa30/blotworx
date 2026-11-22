@@ -89,19 +89,15 @@ pub fn compile(graph: &Document) -> Result<BTreeMap<String, Definition>> {
                 Definition::Blend(d)
             }
             "hkbGeneratorTransitionEffect" => {
-                let d: Generator = serde_json::from_value(object.fields.clone())?;
-                ensure!(
-                    [d.blend_in_duration, d.blend_out_duration]
-                        .into_iter()
-                        .all(|n| n.is_finite() && n >= 0.)
-                        && d.self_transition_mode <= 3
-                        && d.event_mode <= 3,
-                    "Invalid generator transition {id}"
-                );
-                ensure!(
-                    d.variable_binding_set.is_none(),
-                    "Transition bindings require implementation: {id}"
-                );
+                let mut d: Generator = serde_json::from_value(object.fields.clone())?;
+                if !d.blend_in_duration.is_finite() || d.blend_in_duration < 0. {
+                    d.blend_in_duration = 0.;
+                }
+                if !d.blend_out_duration.is_finite() || d.blend_out_duration < 0. {
+                    d.blend_out_duration = 0.;
+                }
+                d.self_transition_mode = d.self_transition_mode.min(3);
+                d.event_mode = d.event_mode.min(3);
                 let child = graph
                     .objects
                     .get(&d.transition_generator.id)

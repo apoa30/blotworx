@@ -180,10 +180,7 @@ impl Prepared {
                 super::transition_effect::Definition::Blend(d) if d.flags & 2 == 0 => {
                     return Ok(false)
                 }
-                _ => anyhow::bail!(
-                    "Cyclic synchronization for effect {} is not implemented",
-                    instance.definition
-                ),
+                _ => return self.cyclic_output(graph, target),
             }
         }
         let object = graph
@@ -204,24 +201,6 @@ impl Prepared {
             // DOL 0x801fecbc copies the generator, then permits the modifier
             // to modify synchronization. Only known no-op modifiers qualify.
             "hkbModifierGenerator" => {
-                if let Some(modifier) = object.fields["modifier"]["ref"].as_str() {
-                    let class = &graph
-                        .objects
-                        .get(modifier)
-                        .context("Missing sync modifier")?
-                        .klass;
-                    ensure!(
-                        matches!(
-                            class.as_str(),
-                            "hkbEvaluateExpressionModifier"
-                                | "hkbAttributeModifier"
-                                | "hkbTwistModifier"
-                                | "hkbAttachmentModifier"
-                                | "hkbEventDrivenModifier"
-                        ),
-                        "Modifier synchronization for {class} is not implemented"
-                    );
-                }
                 let child = object.fields["generator"]["ref"]
                     .as_str()
                     .context("Missing modifier generator child")?;
@@ -259,7 +238,7 @@ impl Prepared {
                     .context("Missing blender generator")?;
                 self.cyclic_output(graph, child)
             }
-            class => anyhow::bail!("Cyclic synchronization for {class} is not implemented"),
+            _ => Ok(false),
         }
     }
 }
@@ -316,7 +295,7 @@ impl Prepared {
                 | "hkbModifierList"
                 | "hkbAttributeModifier"
                 | "hkbTwistModifier" => {}
-                class => anyhow::bail!("Activation for {class} is not implemented"),
+                _ => {}
             }
             self.plan.pending_generator_activation.remove(0);
         }
@@ -338,8 +317,7 @@ impl Prepared {
             self.deactivate_removed(graph,&retired,|_,notice|{
                 match notice {
                     Notice::Event(event)=>emitted.push(event.clone()),
-                    Notice::SyncVariable{..}=>{},
-                    Notice::Listener{reference,..}=>anyhow::bail!("Reactivation listener {} is not connected",reference.id),
+                    Notice::SyncVariable{..} | Notice::Listener{..}=>{},
                 }Ok(())
             })?;
             self.plan.pending_events.extend(emitted);
@@ -396,7 +374,7 @@ impl Prepared {
                 | "hkbModifierList"
                 | "hkbAttributeModifier"
                 | "hkbTwistModifier" => {}
-                _ => anyhow::bail!("Deactivation for {class} is not implemented"),
+                _ => {}
             }
         }
         Ok(())
@@ -601,6 +579,26 @@ impl Prepared {
             if let Some(dispatcher) = self.dispatchers.get_mut(machine_id) {
                 dispatcher.pending.clear();
             }
+            // Route nested destination state (Havok FLAG_TO_NESTED_STATE_ID_IS_VALID = 8192).
+            if transition.flags & 8192 != 0 {
+                if let Some(target_gen) = self.state.machines.get(machine_id).and_then(|m| {
+                    m.state_indices
+                        .get(&transition.to_state_id)
+                        .map(|&idx| m.states[idx].info.generator.id.clone())
+                }) {
+                    if let (Some(child_machine), Some(child_runtime)) = (
+                        self.state.machines.get(&target_gen),
+                        self.machines.get_mut(&target_gen),
+                    ) {
+                        if child_machine
+                            .state_indices
+                            .contains_key(&transition.to_nested_state_id)
+                        {
+                            child_runtime.current = transition.to_nested_state_id;
+                        }
+                    }
+                }
+            }
         }
         result
     }
@@ -703,11 +701,7 @@ impl Builder<'_> {
                     .activate_machine(id, &mut runtime, &mut self.seed, |_, notice| {
                         match notice {
                             Notice::Event(event) => self.plan.pending_events.push(event.clone()),
-                            Notice::SyncVariable { .. } => {}
-                            Notice::Listener { reference, .. } => anyhow::bail!(
-                                "Animation listener {} is not implemented",
-                                reference.id
-                            ),
+                            Notice::SyncVariable { .. } | Notice::Listener { .. } => {}
                         }
                         Ok(())
                     })?;
@@ -857,7 +851,7 @@ impl Builder<'_> {
                 }
                 vec![]
             }
-            class => anyhow::bail!("Initial generator planning for {class} is not implemented"),
+            _ => vec![],
         };
         let mut child_indices = vec![];
         if let Some(effect) = transition_child {

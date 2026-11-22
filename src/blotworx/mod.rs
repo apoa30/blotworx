@@ -557,6 +557,7 @@ mod jigsaw_topology;
 mod jigsaw_transition;
 mod knockback;
 mod ledge_control;
+mod ledge_grab;
 mod lifetime;
 mod level_session;
 mod loading_screen;
@@ -2501,6 +2502,8 @@ struct Engine {
     hose_phase: Option<brush::Firing>,
     hose_clock: brush::EmissionClock,
     hose_emitters: [bool; 2],
+    ink_hold: Option<(usize, f32)>,
+    blast_cooldown: [f32; 2],
     ear_pose: Option<ears::Pose>,
     clip_preview: Option<clip_preview::ClipPreview>,
     player_skin_frame: clip_preview::SkinFrame,
@@ -2645,6 +2648,8 @@ impl Engine {
             hose_phase: None,
             hose_clock: Default::default(),
             hose_emitters: [false; 2],
+            ink_hold: None,
+            blast_cooldown: [0.; 2],
             diagnostic_strafe: o.diagnostic_strafe,
             diagnostic_shuffle: o.diagnostic_shuffle,
             clip_preview: None,
@@ -2964,6 +2969,8 @@ impl Engine {
         self.hose_phase = None;
         self.hose_emitters = [false; 2];
         self.hose_clock = Default::default();
+        self.ink_hold = None;
+        self.blast_cooldown = [0.; 2];
         self.movie = None;
         self.last_movie = None;
         #[cfg(feature = "blotworx-ui-render")]
@@ -3361,15 +3368,171 @@ impl Engine {
                     world.spawn_sketch_root("paintanvil",[player.position[0]+s*2.5,player.position[1]+3.5,player.position[2]-c*2.5],
                         [c,0.,-s,0.,1.,0.,s,0.,c])?;
                 }
-                requested_hose=match raw_requested_hose.filter(|_| !player.script_input_restricted
-                    && !world.side_scroll_disables("SideScrollDisablePaint")) {
-                    Some(ink) if capture_mode && self.diagnostic_hose.is_some()=>Some(ink),
-                    Some(ink)=>{
-                        let channel=if ink==0 {brush::Ink::Paint}else{brush::Ink::Thinner};
-                        if world.player_ability_enabled("Brush",channel)? {Some(ink)}else{None}
-                    },
-                    None=>None,
+                for cd in &mut self.blast_cooldown {
+                    if *cd > 0. {
+                        *cd = (*cd - STEP).max(0.);
+                    }
+                }
+                let allowed_raw_ink = raw_requested_hose.filter(|_| {
+                    !player.script_input_restricted
+                        && !world.side_scroll_disables("SideScrollDisablePaint")
+                });
+                let mut tap_ink: Option<usize> = None;
+                requested_hose = match allowed_raw_ink {
+                    Some(ink) if capture_mode && self.diagnostic_hose.is_some() => Some(ink),
+                    Some(ink) => {
+                        let channel = if ink == 0 { brush::Ink::Paint } else { brush::Ink::Thinner };
+                        let held_time = match self.ink_hold {
+                            Some((prev, t)) if prev == ink => {
+                                let next = t + STEP;
+                                self.ink_hold = Some((ink, next));
+                                next
+                            }
+                            _ => {
+                                self.ink_hold = Some((ink, 0.));
+                                0.
+                            }
+                        };
+                        if held_time >= 0.16 && world.player_ability_enabled("Brush", channel)? {
+                            Some(ink)
+                        } else {
+                            None
+                        }
+                    }
+                    None => {
+                        if let Some((ink, held_time)) = self.ink_hold.take() {
+                            if held_time <= 0.25 && !self.hose_active {
+                                tap_ink = Some(ink);
+                            }
+                        }
+                        None
+                    }
                 };
+                if let Some(ink) = tap_ink {
+                    let channel = if ink == 0 { brush::Ink::Paint } else { brush::Ink::Thinner };
+                    let airborne = !player.grounded
+                        && !player.stairs_ground_retained
+                        && !player.ledge.is_active();
+                    if airborne {
+                        let can_air = world.player_ability_enabled("Brush", channel)?
+                            || world.player_ability_enabled("Blast", channel)?;
+                        if can_air && player.air_ink_jump_available {
+                            let cost = world.ammo.settings.channels[ink].jump_cost;
+                            if world.ammo.available(ink) < cost {
+                                world.post_audio_from_game(
+                                    world.player_entity,
+                                    brush_runtime::DRY_SOUND_EVENT,
+                                );
+                            } else if player.begin_ink_jump() {
+                                world.ammo.change(ink, -cost, &mut |_, _, _| Ok(()))?;
+                                let origin = [
+                                    player.position[0],
+                                    player.position[1] + 0.25,
+                                    player.position[2],
+                                ];
+                                let ring = 1.0_f32;
+                                for offset in [
+                                    [0., -4.0, 0.],
+                                    [ring, -4.0, 0.],
+                                    [-ring, -4.0, 0.],
+                                    [0., -4.0, ring],
+                                    [0., -4.0, -ring],
+                                ] {
+                                    let target = [
+                                        origin[0] + offset[0],
+                                        origin[1] + offset[1],
+                                        origin[2] + offset[2],
+                                    ];
+                                    world.projectile_preview.spawn(
+                                        &world.report,
+                                        channel,
+                                        world.player_entity as u64,
+                                        origin,
+                                        target,
+                                    )?;
+                                }
+                                if let Some(preview) = &mut self.authored_preview {
+                                    let ev = if ink == 1 {
+                                        "EVENT_Start_ThinnerJump"
+                                    } else {
+                                        "EVENT_Start_DoubleJump"
+                                    };
+                                    let _ = preview.queue_named_event(&world.player_behavior, ev);
+                                }
+                            }
+                        }
+                    } else if self.blast_cooldown[ink] <= 0.
+                        && world.player_ability_enabled("Blast", channel)?
+                    {
+                        const BLAST_COST: f32 = 5.0;
+                        if world.ammo.available(ink) < BLAST_COST {
+                            world.post_audio_from_game(
+                                world.player_entity,
+                                brush_runtime::DRY_SOUND_EVENT,
+                            );
+                        } else {
+                            world.ammo.change(ink, -BLAST_COST, &mut |_, _, _| Ok(()))?;
+                            self.blast_cooldown[ink] = 0.6;
+                            let origin = [
+                                player.position[0],
+                                player.position[1] + 0.75,
+                                player.position[2],
+                            ];
+                            let (sy, cy) = player.yaw.sin_cos();
+                            let fwd = [sy, 0., cy];
+                            let right = [cy, 0., -sy];
+                            // Spawn authored BlastConePaint / BlastConeThinner FX
+                            // from _Dynamic.pak (ConfigFiles.ini [MickeyAbilities_Blast]).
+                            let cone_name = if ink == 0 {
+                                "BlastConePaint"
+                            } else {
+                                "BlastConeThinner"
+                            };
+                            let cone_pose: [f32; 13] = [
+                                cy, 0., sy,
+                                0., 1., 0.,
+                                -sy, 0., cy,
+                                origin[0], origin[1], origin[2],
+                                1.0,
+                            ];
+                            if let Err(err) = world.start_palette_effect(
+                                world.player_entity,
+                                cone_name,
+                                Some(&cone_pose),
+                                Some(0.65),
+                            ) {
+                                log::warn!("Blast cone FX {cone_name} skipped: {err:#}");
+                            }
+                            let _ = world.dispatch_blast_cone(origin, fwd, channel);
+                            for (side, up) in [
+                                (0., 0.),
+                                (0.22, 0.),
+                                (-0.22, 0.),
+                                (0., 0.14),
+                                (0., -0.14),
+                            ] {
+                                let target = [
+                                    origin[0] + (fwd[0] + right[0] * side) * 5.0,
+                                    origin[1] + up * 5.0,
+                                    origin[2] + (fwd[2] + right[2] * side) * 5.0,
+                                ];
+                                world.projectile_preview.spawn(
+                                    &world.report,
+                                    channel,
+                                    world.player_entity as u64,
+                                    origin,
+                                    target,
+                                )?;
+                            }
+                            if let Some(preview) = &mut self.authored_preview {
+                                let _ = preview.queue_named_event(
+                                    &world.player_behavior,
+                                    "EVENT_Start_Blast",
+                                );
+                            }
+                        }
+                    }
+                }
                 if self.brush_action_respawns!=player.respawns {
                     if let Some(preview)=&mut self.authored_preview {
                         preview.synchronize_player(player,&world.player_behavior,
@@ -3477,6 +3640,9 @@ impl Engine {
                     world.player_controller_tick(preview,player)?;
                     world.export_player_animation_frames(std::mem::take(&mut preview.playback.emitted_frames))?;
                     world.synchronize_player_knockback(player);
+                    // Publish Mickey's current tick position and yaw BEFORE updating
+                    // skeletal children so the paintbrush never lags 1 tick behind rotation.
+                    world.entities[world.player_entity].set_controller_pose(player.position, player.yaw);
                     world.update_skeletal_children(Some(&preview.playback.pose))?;
                     for _ in 0..std::mem::take(&mut preview.pending_combat_queries) {
                         world.dispatch_live_spin(&mut preview.spin_hits)?;
@@ -3623,9 +3789,13 @@ impl Engine {
         world.entities[world.player_entity]
             .set_controller_pose(controller.player.position, controller.player.yaw);
         if let Err(e) = result {
-            self.error = Some(format!("Authored animation: {e:#}"));
-            self.paused = true;
-            return;
+            let message = format!("Authored animation: {e:#}");
+            log::warn!("{message}");
+            self.error = Some(message);
+            if capture_mode {
+                self.paused = true;
+                return;
+            }
         }
         //Native6f58 consumes the published frame clocks, not a character
         //catch-up delta. Update exactly once even when this frame had no ticks.
@@ -3753,6 +3923,42 @@ impl Engine {
             world.entities[world.player_entity].controller_matrix(position, player.yaw);
         for &i in &world.player_draws {
             draws[i].trans_mat = player_matrix;
+        }
+        // Apply the same sub-tick presentation interpolation delta to Mickey's
+        // attached children (e.g. paintbrush) so they stay locked in his hand at 60/144Hz.
+        let interp_delta = [
+            position[0] - player.position[0],
+            position[1] - player.position[1],
+            position[2] - player.position[2],
+        ];
+        if interp_delta.iter().any(|v| v.abs() > 1e-6) {
+            let mut stack: Vec<usize> = Vec::new();
+            if let Some(slots) = world.live_child_slots.get(&world.player_entity) {
+                stack.extend(slots.iter().flatten().copied());
+            }
+            for (&child, local) in &world.transform_hierarchy {
+                if local.parent == world.player_entity && !stack.contains(&child) {
+                    stack.push(child);
+                }
+            }
+            let mut visited = std::collections::HashSet::new();
+            while let Some(child) = stack.pop() {
+                if !visited.insert(child) {
+                    continue;
+                }
+                if let Some(entity) = world.entities.get(child) {
+                    for draw_idx in entity.draws.clone() {
+                        if let Some(draw) = draws.get_mut(draw_idx) {
+                            draw.trans_mat[12] += interp_delta[0];
+                            draw.trans_mat[13] += interp_delta[1];
+                            draw.trans_mat[14] += interp_delta[2];
+                        }
+                    }
+                }
+                if let Some(slots) = world.live_child_slots.get(&child) {
+                    stack.extend(slots.iter().flatten().copied());
+                }
+            }
         }
         if !self.retail_lighting {
             for (index, draw) in draws.iter_mut().enumerate() {
@@ -5195,7 +5401,7 @@ impl Engine {
                     "nif_camera_transition":world.nif_camera_transition,
                     "nif_camera_native_projection_parity":false,
                     "ledge_controls":world.ledge_controls,
-                    "ledge_detection_and_hanging_implemented":false,
+                    "ledge_detection_and_hanging_implemented":true,
                     "silhouette_pass_implemented":false,
                     "silhouette_candidates":world.render_objects.values().filter(|object|world.render_options.admits_silhouette(object.flags)).count(),
                     "counter_materials":world.counter_materials,

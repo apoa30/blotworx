@@ -535,10 +535,43 @@ impl Batch {
                     ("DamagedLeapGravity", &mut report.motion.damage_leap_gravity),
                     ("DamagedLeapMaxAirSpeed", &mut report.motion.damage_leap_air_speed),
                     ("DamagedLeapAirAccel", &mut report.motion.damage_leap_acceleration),
+                    ("DamagedLeapStunTime", &mut report.motion.damage_leap_stun_time),
+                    ("MinNormalFallSpeed", &mut report.motion.min_normal_fall_speed),
+                    ("MinHardFallSpeed", &mut report.motion.min_hard_fall_speed),
+                    ("MinDeathFallSpeed", &mut report.motion.min_death_fall_speed),
+                    ("LedgeGrabHeight", &mut report.motion.ledge.height),
+                    ("LedgeGrabTranslateSpeed", &mut report.motion.ledge.translate_speed),
+                    ("LedgeGrabMaxGrabDistance", &mut report.motion.ledge.max_grab_distance),
+                    ("LedgeGrabMaxSaveDistance", &mut report.motion.ledge.max_save_distance),
+                    ("LedgeGrabMaxSaveDistanceLeftAndRight", &mut report.motion.ledge.max_save_distance_side),
+                    ("LedgeGrabMaxVelocityToCheckBackwards", &mut report.motion.ledge.max_velocity_check_backwards),
+                    ("LedgeGrabMinDistanceOffGround", &mut report.motion.ledge.min_distance_off_ground),
+                    ("LedgeGrabMinDoubleJumpTime", &mut report.motion.ledge.min_double_jump_time),
+                    ("LedgeGrabFitShapeHeight", &mut report.motion.ledge.fit_shape_height),
+                    ("PushingMaxAngle", &mut report.motion.pushing_max_angle),
+                    ("PushingMaxSpeed", &mut report.motion.pushing_max_speed),
+                    ("PushingMinDesiredSpeed", &mut report.motion.pushing_min_desired_speed),
+                    ("PushingTimeForAnimation", &mut report.motion.pushing_time_for_animation),
+                    ("SlidingMinDownSpeed", &mut report.motion.sliding_min_down_speed),
+                    ("SlidingTimeForAnimation", &mut report.motion.sliding_time_for_animation),
+                    ("SlidingTurnRate", &mut report.motion.sliding_turn_rate),
+                    ("SpeedToStartAutoSlidingOnLedges", &mut report.motion.speed_to_start_auto_sliding_on_ledges),
                 ] {
                     if let Some(value) = motion_value(name) {
                         *target = value.as_f64().with_context(|| format!("Invalid {name}"))? as f32;
                         ensure!(target.is_finite(), "Nonfinite {name}");
+                    }
+                }
+                for (name, target) in [
+                    ("DoesLedgeGrab", &mut report.motion.ledge.enabled),
+                    ("LedgeGrabOnlyInFront", &mut report.motion.ledge.only_in_front),
+                    ("LedgeGrabAllowSidle", &mut report.motion.ledge.allow_sidle),
+                    ("LedgeGrabAllowDuringDoubleJump", &mut report.motion.ledge.allow_during_double_jump),
+                    ("UseButtonForLedgeGrab", &mut report.motion.ledge.use_button),
+                    ("Allow Turn Rate Increase", &mut report.motion.allow_turn_rate_increase),
+                ] {
+                    if let Some(value) = motion_value(name) {
+                        *target = value.as_bool().with_context(|| format!("Invalid {name}"))?;
                     }
                 }
                 report.locomotion_action_settings =

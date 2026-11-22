@@ -360,6 +360,50 @@ impl Preview {
             }
             return Ok(());
         }
+        if let Some(ledge_event) = player.ledge.event {
+            match ledge_event {
+                super::ledge_grab::Event::StartTrying => {
+                    self.queue_named_event(graph, "EVENT_Start_Trying_Ledge_Grab")?;
+                    self.airborne_animation = true;
+                }
+                super::ledge_grab::Event::Reached => {
+                    self.queue_named_event(graph, "EVENT_Start_Ledge_Grab")?;
+                    self.queue_named_event(graph, "EVENT_Done_Ledge_Grab_Reach")?;
+                    self.airborne_animation = true;
+                }
+                super::ledge_grab::Event::StartMantle => {
+                    self.queue_named_event(graph, "EVENT_Start_Ledge_Jump")?;
+                    self.airborne_animation = true;
+                }
+                super::ledge_grab::Event::MantleFinished => {
+                    self.queue_named_event(graph, "EVENT_Stop_Ledge_Jump")?;
+                    self.queue_named_event(graph, "EVENT_Start_Land")?;
+                    self.airborne_animation = false;
+                    return Ok(());
+                }
+                super::ledge_grab::Event::StartLedgeJump => {
+                    self.queue_named_event(graph, "EVENT_Stop_Ledge_Jump")?;
+                    self.queue_named_event(graph, "EVENT_Start_Jump")?;
+                    self.airborne_animation = true;
+                    return Ok(());
+                }
+                super::ledge_grab::Event::Drop => {
+                    self.queue_named_event(graph, "EVENT_Stop_Ledge_Jump")?;
+                    self.queue_named_event(graph, "EVENT_Start_InAir")?;
+                    self.airborne_animation = true;
+                    return Ok(());
+                }
+            }
+        }
+        if player.ledge.is_active() {
+            return Ok(());
+        }
+        if player.slide_started {
+            self.queue_named_event(graph, "EVENT_Start_Slide_Transition")?;
+            self.queue_named_event(graph, "EVENT_Start_Slide")?;
+        } else if player.slide_stopped {
+            self.queue_named_event(graph, "EVENT_Stop_Slide")?;
+        }
         self.apply_ground_motion(player, state)?;
         if player.ground_jump_started || player.air_first_jump_started {
             self.queue_named_event(graph, "EVENT_Start_Jump")?;
@@ -370,12 +414,35 @@ impl Preview {
         } else if player.motion_state() == 2 && player.ground_vectors.is_some() {
             // Ground vectors identify a tick which began on support. Use the
             // authored external airborne event, not the graph-internal Fall
-            // event. Contact classification is still the provisional Box3D
-            // controller; the retail ledge-state routing remains to be matched.
+            // event.
             self.queue_named_event(graph, "EVENT_Start_InAir")?;
             self.airborne_animation = true;
         } else if self.airborne_animation && player.grounded {
-            self.queue_named_event(graph, "EVENT_Start_Land")?;
+            // REL 0x307c6c..0x307de8: select death/hard/stationary/walk/run landing event.
+            let severity = player.landed_fall_severity.unwrap_or(0);
+            if severity >= 3 {
+                if self.queue_named_event(graph, "EVENT_Start_Death_Fall_Rescue").is_err() {
+                    let _ = self.queue_named_event(graph, "EVENT_Start_HardLand");
+                }
+            } else if severity >= 2 {
+                self.queue_named_event(graph, "EVENT_Start_HardLand")?;
+            } else {
+                let horiz = player.velocity[0].hypot(player.velocity[2]);
+                let event = if horiz < 0.1 || self.attributes.values.len() < 2 {
+                    "EVENT_Start_Land"
+                } else {
+                    let scale = player.max_move_speed() / self.attributes.values[1].max(1e-4);
+                    let walk = self.attributes.values[0] * scale;
+                    let run = self.attributes.values[1] * scale;
+                    let mid = walk + 0.5 * (run - walk);
+                    if horiz < mid {
+                        "EVENT_Start_Land_Walk"
+                    } else {
+                        "EVENT_Start_Land_Run"
+                    }
+                };
+                self.queue_named_event(graph, event)?;
+            }
             self.airborne_animation = false;
         }
         Ok(())

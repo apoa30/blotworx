@@ -123,9 +123,10 @@ impl World {
         {
             return Ok(());
         }
-        let method = field(shooter, "Shooter Delivery Method")?.as_u64()
-            .context("Invalid shooter delivery method")?;
-        ensure!(matches!(method, 2 | 4), "Unsupported shooter delivery method {method}");
+        let method = field(shooter, "Shooter Delivery Method")
+            .ok()
+            .and_then(|v| v.as_u64())
+            .unwrap_or(2);
         let speed = field(shooter, "Shooter Speed")?
             .as_f64()
             .context("Invalid shooter speed")? as f32;
@@ -154,8 +155,9 @@ impl World {
             .collect::<Result<Vec<_>>>()?;
         let origin = muzzle.transform[12..15].try_into()?;
         let rotation = muzzle.runtime_rotation;
-        let velocity = if method == 4 {
-            launch_velocity(origin, aim, speed, self.report.physics_world.gravity[1])?
+        let use_gravity = matches!(method, 3 | 4 | 5 | 6);
+        let velocity = if use_gravity {
+            launch_velocity(origin, aim, speed.max(2.0), self.report.physics_world.gravity[1])?
         } else {
             let delta = physics::sub(aim, origin);
             let distance = physics::length(delta);
@@ -166,6 +168,10 @@ impl World {
         for name in names {
             let entity = self.spawn_palette_root(weapon, &name, origin, rotation, "")?;
             let result = (|| -> Result<()> {
+                // REL 0x390c70 -> 0x38e794 -> 0x3831c8(dynamic=1): activate the
+                // spawned projectile's rigid body before publishing velocity so
+                // keyframed templates actually launch instead of hovering in mid-air.
+                self.set_entity_motion_enabled(entity, true)?;
                 let (&source, &owner) = self
                     .dynamic_runtime_sources
                     .iter()
@@ -175,18 +181,20 @@ impl World {
                     .dynamic_constructions
                     .get_mut(&source)
                     .context("Missing projectile body construction")?;
-                let [body] = construction.bodies.as_mut_slice() else {
-                    anyhow::bail!("Mode-4 launch requires one projectile body");
-                };
+                let body = construction
+                    .bodies
+                    .first_mut()
+                    .context("Projectile body missing")?;
+                ensure!(
+                    matches!(body.motion.current.motion_type(), 2 | 3 | 6 | 7),
+                    "Projectile body stayed non-dynamic (motion_type={}) after activation",
+                    body.motion.current.motion_type()
+                );
                 let shape = *body
                     .shapes
                     .first()
                     .context("Projectile body has no collision shape")?;
-                // The template's body carries zero gravity before release.
-                // Mode 4 solves for the world's gravity in REL39191c. Apply
-                // that gravity to the released Box3D body without changing
-                // the source projectile or its prelaunch component defaults.
-                if method == 4 {
+                if use_gravity {
                     body.motion.current.initialize_motion_tuning(|name| {
                         Ok(if name == "Gravity Factor" { 1. } else { 0. })
                     })?;

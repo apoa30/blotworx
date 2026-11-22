@@ -28,12 +28,12 @@ impl World {
             && !self.removed_entities.contains(&owner)
             && !self.spawner_sources.contains(&owner)
             && self.ai_brains.get(&owner).is_some_and(|brain| {
-                brain.ai_type.eq_ignore_ascii_case("Pete:SmallWorld")
-                    || brain.ai_type.to_ascii_lowercase().starts_with("gremlin")
-                    || (!brain.behaviors.iter().any(|name| name == "RobotArmGeneral")
-                        && (!brain.scripted_move.is_empty()
-                            || (!self.uses_demo_combat(owner, &brain.ai_type) && !brain.patrol.is_empty()))
-                        && self.entities[owner].components.iter().any(|c| c.class_name == "BasicAIControllerComponent"))
+                !self.uses_demo_combat(owner, &brain.ai_type)
+                    && (brain.ai_type.eq_ignore_ascii_case("Pete:SmallWorld")
+                        || brain.ai_type.to_ascii_lowercase().starts_with("gremlin")
+                        || (!brain.behaviors.iter().any(|name| name == "RobotArmGeneral")
+                            && (!brain.scripted_move.is_empty() || !brain.patrol.is_empty())
+                            && self.entities[owner].components.iter().any(|c| c.class_name == "BasicAIControllerComponent")))
             })
             && self.authored_havok.contains(owner)
             && self.character_physics.get(&owner).is_some_and(|b|b.is_ok())
@@ -225,6 +225,6 @@ fn update(w:&mut World,b:usize,c:Context)->Result<u32>{
             if let Some(movement)=w.demo_story.npc_fallback.moves.get(&c.owner).copied(){if !w.drive_demo_npc_move(c.owner,movement,c.delta,false)?{return Ok(1)}}
             w.demo_story.npc_fallback.moves.remove(&c.owner);super::ai_scripted_move::CompletionHost::reached_position(w,c.owner)?;Ok(2)
         },
-        _=>anyhow::bail!("Unknown temporary NPC behavior"),
+        _=>{let _=w.stop_demo_npc_motion(c.owner,false);Ok(1)},
     }
 }

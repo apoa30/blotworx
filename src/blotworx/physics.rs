@@ -1010,11 +1010,13 @@ impl Collision {
         &mut self,
         sources: Vec<super::character_contacts::Source>,
     ) -> anyhow::Result<()> {
-        self.native_character_contacts
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Native character contact registry absent"))?
-            .borrow_mut()
-            .append(sources)
+        let Some(registry) = self.native_character_contacts.as_ref() else {
+            // Streamed scenes published during OnMapLoad before initial
+            // character-contact initialization are picked up when the full
+            // registry is constructed from report.collision_parts.
+            return Ok(());
+        };
+        registry.borrow_mut().append(sources)
     }
     pub fn take_character_contact_error(&self) -> Option<String> {
         self.character_contact_error.borrow_mut().take()
@@ -3098,6 +3100,20 @@ pub struct Motion {
     pub em2_moves: Option<super::locomotion_actions::Settings>,
     /// EM2 The180MinAllowedSpeed: extra factor on the "running fast" threshold (360 0x829f6bf0).
     pub turn_min_allowed_speed: f32,
+    pub damage_leap_stun_time: f32,
+    pub min_normal_fall_speed: f32,
+    pub min_hard_fall_speed: f32,
+    pub min_death_fall_speed: f32,
+    pub ledge: super::ledge_grab::Settings,
+    pub allow_turn_rate_increase: bool,
+    pub pushing_max_angle: f32,
+    pub pushing_max_speed: f32,
+    pub pushing_min_desired_speed: f32,
+    pub pushing_time_for_animation: f32,
+    pub sliding_min_down_speed: f32,
+    pub sliding_time_for_animation: f32,
+    pub sliding_turn_rate: f32,
+    pub speed_to_start_auto_sliding_on_ledges: f32,
 }
 impl Default for Motion {
     fn default() -> Self {
@@ -3140,6 +3156,20 @@ impl Default for Motion {
             damage_leap_acceleration: 20.,
             em2_moves: None,
             turn_min_allowed_speed: 1.,
+            damage_leap_stun_time: 1.0,
+            min_normal_fall_speed: 15.0,
+            min_hard_fall_speed: 25.0,
+            min_death_fall_speed: 100.0,
+            ledge: Default::default(),
+            allow_turn_rate_increase: true,
+            pushing_max_angle: 75.0,
+            pushing_max_speed: 0.95,
+            pushing_min_desired_speed: 1e-5,
+            pushing_time_for_animation: 0.1,
+            sliding_min_down_speed: -0.4,
+            sliding_time_for_animation: 0.36666,
+            sliding_turn_rate: 0.0,
+            speed_to_start_auto_sliding_on_ledges: 0.5,
         }
     }
 }
@@ -3204,6 +3234,17 @@ pub struct Player {
     brush_turn_rate: Option<f32>,
     facing_target: f32,
     movement_direction_override: Option<V>,
+    pub ledge: super::ledge_grab::State,
+    pub ledge_gate_enabled: bool,
+    ledge_pose_locked: bool,
+    peak_air_down_speed: f32,
+    /// One-tick landing severity from REL 0x307974 (0=soft, 1=normal, 2=hard, 3=death).
+    pub landed_fall_severity: Option<u8>,
+    sliding_timer: f32,
+    pub sliding_animation_active: bool,
+    pub slide_started: bool,
+    pub slide_stopped: bool,
+    pub air_ink_jump_available: bool,
 }
 impl Player {
     pub(super) fn can_spray_below(&self) -> bool {
@@ -3229,10 +3270,46 @@ impl Player {
         self.planar_support_normal(normal)
             .is_some_and(|normal| normal[1] >= self.motion.max_slope_degrees.to_radians().cos())
     }
+
+    /// Mid-air Paint/Thinner tap jump boost (SpecialJump / ThinnerJump).
+    pub fn begin_ink_jump(&mut self) -> bool {
+        if self.grounded
+            || self.ledge.is_active()
+            || self.damage_leaping
+            || self.native_knockback
+            || !self.air_ink_jump_available
+        {
+            return false;
+        }
+        self.air_ink_jump_available = false;
+        self.jump_stage = None;
+        // Crisp upward hover/momentum boost without overriding stronger upward jump velocity.
+        let boost = jump_launch_speed(self.motion.gravity_up, 0.55);
+        self.velocity[1] = self.velocity[1].max(0.0).max(boost);
+        true
+    }
+    /// Bounce Mickey upward when landing on an NPC's head (Config.ini StompJumpHeightBonus).
+    pub fn bounce_off_head(&mut self, height_multiplier: f32) {
+        self.ledge.reset();
+        self.ledge_pose_locked = false;
+        self.grounded = false;
+        self.stairs_ground_retained = false;
+        self.jump_stage = None;
+        self.ground_jump_started = true;
+        self.ground_jump_available = false;
+        self.double_jump_available = true;
+        self.air_ink_jump_available = true;
+        self.position[1] += 0.08;
+        self.velocity[1] =
+            jump_launch_speed(self.motion.gravity_up, self.motion.jump_height * height_multiplier);
+        self.pending_physics = None;
+    }
     pub(super) fn begin_damage_leap(&mut self) -> bool {
         if !self.motion.damage_leap_enabled || self.native_knockback || self.damage_leaping {
             return false;
         }
+        self.ledge.reset();
+        self.ledge_pose_locked = false;
         self.damage_leaping = true;
         self.damage_leap_landed = false;
         self.velocity[1] = self.motion.damage_leap_launch_speed;
@@ -3377,9 +3454,28 @@ impl Player {
             brush_turn_rate: None,
             facing_target: 0.,
             movement_direction_override: None,
+            ledge: Default::default(),
+            ledge_gate_enabled: true,
+            ledge_pose_locked: false,
+            peak_air_down_speed: 0.,
+            landed_fall_severity: None,
+            sliding_timer: 0.,
+            sliding_animation_active: false,
+            slide_started: false,
+            slide_stopped: false,
+            air_ink_jump_available: false,
         }
     }
     pub fn respawn(&mut self) {
+        self.ledge.reset();
+        self.ledge_pose_locked = false;
+        self.peak_air_down_speed = 0.;
+        self.landed_fall_severity = None;
+        self.sliding_timer = 0.;
+        self.sliding_animation_active = false;
+        self.slide_started = false;
+        self.slide_stopped = false;
+        self.air_ink_jump_available = false;
         self.slope_gravity_force = 0.;
         self.native_knockback = false;
         self.damage_leaping = false;
@@ -3543,6 +3639,11 @@ impl Player {
         self.air_first_jump_started = false;
         self.second_jump_started = false;
         self.damage_leap_landed = false;
+        self.landed_fall_severity = None;
+        self.slide_started = false;
+        self.slide_stopped = false;
+        self.ledge_pose_locked = false;
+        self.ledge.tick_cooldown(dt);
         let mut jump = jump;
         if self.spin_gravity.is_some() || self.damage_leaping {
             jump.pressed = false;
@@ -3550,6 +3651,7 @@ impl Player {
         }
         self.previous = self.position;
         if self.native_knockback || self.knockback_velocity_override {
+            self.ledge.reset();
             self.slope_gravity_force = 0.;
             self.stairs_ground_retained = false;
             self.knockback_velocity_override = false;
@@ -3559,6 +3661,74 @@ impl Player {
             self.ground_vectors = None;
             self.animation_velocity = self.velocity;
             return;
+        }
+        if self.ledge.is_active() {
+            let jump_speed = jump_launch_speed(self.motion.gravity_up, self.motion.jump_height);
+            if let Some(outcome) = self.ledge.step(
+                &self.motion.ledge,
+                self.position,
+                direction,
+                jump.pressed,
+                jump_speed,
+                dt,
+            ) {
+                self.slope_gravity_force = 0.;
+                self.stairs_ground_retained = false;
+                self.pending_ground_support = None;
+                self.support_carry = None;
+                self.ground_vectors = None;
+                self.peak_air_down_speed = 0.;
+                match outcome {
+                    super::ledge_grab::StepOutcome::Hold {
+                        position,
+                        velocity,
+                        yaw,
+                    } => {
+                        self.position = position;
+                        self.velocity = velocity;
+                        self.yaw = yaw;
+                        self.facing_target = yaw;
+                        self.grounded = false;
+                        self.ledge_pose_locked = true;
+                    }
+                    super::ledge_grab::StepOutcome::Jump {
+                        position,
+                        velocity,
+                        yaw,
+                    } => {
+                        self.position = position;
+                        self.velocity = velocity;
+                        self.yaw = yaw;
+                        self.facing_target = yaw;
+                        self.grounded = false;
+                        self.ground_jump_started = true;
+                        self.ground_jump_available = false;
+                        self.double_jump_available = true;
+                        self.last_ground_y = position[1];
+                        self.active_jump_height = self.motion.jump_height;
+                        self.jump_stage = None;
+                    }
+                    super::ledge_grab::StepOutcome::MantleFinished { position, yaw } => {
+                        self.position = position;
+                        self.velocity = [0.; 3];
+                        self.yaw = yaw;
+                        self.facing_target = yaw;
+                        self.grounded = true;
+                        self.ground_jump_available = true;
+                        self.double_jump_available = true;
+                        self.last_ground_y = position[1];
+                        self.ledge_pose_locked = true;
+                    }
+                    super::ledge_grab::StepOutcome::Drop { velocity } => {
+                        self.velocity = velocity;
+                        self.grounded = false;
+                        self.ground_jump_available = false;
+                        self.double_jump_available = true;
+                    }
+                }
+                self.animation_velocity = self.velocity;
+                return;
+            }
         }
         let incoming_velocity = self.velocity;
         // World updates (painting, spawning, retirement, other movers) may
@@ -3744,6 +3914,8 @@ impl Player {
                 frame_ground_velocity = Some(ground_velocity);
                 [ground_velocity[0], ground_velocity[2]]
             }
+        } else if self.script_input_restricted && self.jump_stage.is_some() {
+            [self.velocity[0], self.velocity[2]]
         } else {
             let (accel, side_accel) = if self.damage_leaping {
                 let accel = self.motion.damage_leap_acceleration;
@@ -3900,8 +4072,11 @@ impl Player {
             // movement forces the beveled authored hull down into stair edges,
             // cancelling the ground acceleration before it can climb them.
             // Ground support is tested separately with its downward probe.
+            let sliding_support =
+                ground_motion && self.support_state == Some(super::support::State::Sliding);
             if !leaving_jump_state
                 && !self.stairs_ground_retained
+                && !sliding_support
                 && (!ground_motion || !walkable_support)
             {
                 self.velocity[1] -= if self.damage_leaping {
@@ -3914,6 +4089,22 @@ impl Player {
             }
         }
         if ground_motion && self.jump_stage.is_none() {
+            // On a steep sliding slope, strip uphill input so Mickey slides
+            // cleanly down the slope instead of climbing or fighting double gravity.
+            if self.support_state == Some(super::support::State::Sliding) {
+                if let Some(normal) = support_normal {
+                    let horiz_len = normal[0].hypot(normal[2]);
+                    if horiz_len > 1e-4 {
+                        let nx = normal[0] / horiz_len;
+                        let nz = normal[2] / horiz_len;
+                        let into_slope = self.velocity[0] * nx + self.velocity[2] * nz;
+                        if into_slope < 0. {
+                            self.velocity[0] -= nx * into_slope;
+                            self.velocity[2] -= nz * into_slope;
+                        }
+                    }
+                }
+            }
             let output = super::stairs::reproject(
                 [self.velocity[0], self.velocity[1], self.velocity[2], 0.],
                 [0., 1., 0., 0.],
@@ -3932,16 +4123,27 @@ impl Player {
             && self.jump_stage.is_none()
             && self.support_state == Some(super::support::State::Sliding)
         {
-            let output = super::stairs::sliding_velocity(
-                [self.velocity[0], self.velocity[1], self.velocity[2], 0.],
-                [0., 1., 0., 0.],
-                incoming_velocity[1],
-                self.max_move_speed(),
-                dt,
-                &self.motion.stairs,
-                &mut self.slope_gravity_force,
-            );
-            self.velocity.copy_from_slice(&output[..3]);
+            if let Some(normal) = support_normal {
+                // Project gravity onto the steep slope tangent for smooth downhill sliding.
+                let g = self.motion.gravity_down * dt;
+                let gx = normal[0] * normal[1] * g;
+                let gy = (normal[1] * normal[1] - 1.0) * g;
+                let gz = normal[2] * normal[1] * g;
+                self.velocity[0] += gx;
+                self.velocity[1] += gy;
+                self.velocity[2] += gz;
+            } else {
+                let output = super::stairs::sliding_velocity(
+                    [self.velocity[0], self.velocity[1], self.velocity[2], 0.],
+                    [0., 1., 0., 0.],
+                    incoming_velocity[1],
+                    self.max_move_speed(),
+                    dt,
+                    &self.motion.stairs,
+                    &mut self.slope_gravity_force,
+                );
+                self.velocity.copy_from_slice(&output[..3]);
+            }
         } else if self.stairs_ground_retained && self.jump_stage.is_none() {
             self.slope_gravity_force = 0.;
             let output = super::stairs::above_stairs_velocity(
@@ -3990,6 +4192,14 @@ impl Player {
     }
     fn finish_step_inner(&mut self, world: &Collision, dt: f32) {
         let physical = self.pending_physics.take();
+        if self.ledge_pose_locked {
+            self.ledge_pose_locked = false;
+            return;
+        }
+        let was_airborne = !self.grounded && !self.stairs_ground_retained;
+        if was_airborne && self.velocity[1] < 0. {
+            self.peak_air_down_speed = self.peak_air_down_speed.max(-self.velocity[1]);
+        }
         if let Some(pose) = physical {
             self.position = pose.position;
             self.velocity = pose.linear;
@@ -4038,11 +4248,70 @@ impl Player {
                 self.support_normal_walkable(normal)
             });
         if landed {
+            if self.sliding_animation_active {
+                self.sliding_animation_active = false;
+                self.slide_stopped = true;
+            }
+            self.sliding_timer = 0.;
+            if was_airborne {
+                // REL 0x307974: classify landing fall severity from peak downward speed.
+                let down = self.peak_air_down_speed;
+                self.landed_fall_severity = Some(if down >= self.motion.min_death_fall_speed {
+                    3
+                } else if down >= self.motion.min_hard_fall_speed {
+                    2
+                } else if down >= self.motion.min_normal_fall_speed {
+                    1
+                } else {
+                    0
+                });
+            }
+            self.peak_air_down_speed = 0.;
             self.damage_leap_landed = std::mem::take(&mut self.damage_leaping);
             self.jump_stage = None;
             self.double_jump_available = true;
             self.ground_jump_available = true;
+            self.air_ink_jump_available = true;
             self.last_ground_y = self.position[1];
+        } else if self.support_state == Some(super::support::State::Sliding)
+            && self.velocity[1] <= self.motion.sliding_min_down_speed
+            && !self.damage_leaping
+            && !self.native_knockback
+            && self.jump_stage.is_none()
+        {
+            // REL State 3 (0x223f38..0x224090): steep-slope sliding animation gate.
+            self.sliding_timer += dt;
+            if !self.sliding_animation_active
+                && self.sliding_timer >= self.motion.sliding_time_for_animation
+            {
+                self.sliding_animation_active = true;
+                self.slide_started = true;
+            }
+        } else {
+            if self.sliding_animation_active {
+                self.sliding_animation_active = false;
+                self.slide_stopped = true;
+            }
+            self.sliding_timer = 0.;
+        }
+        if !landed
+            && !self.grounded
+            && !self.damage_leaping
+            && !self.native_knockback
+            && self.jump_stage.is_none()
+        {
+            if self.velocity[1] < 0. {
+                self.peak_air_down_speed = self.peak_air_down_speed.max(-self.velocity[1]);
+            }
+            self.ledge.try_detect(
+                world,
+                &self.motion.ledge,
+                self.ledge_gate_enabled,
+                self.position,
+                self.velocity,
+                self.yaw,
+                self.motion.max_slope_degrees.to_radians().cos(),
+            );
         }
         if (world.recovery_min_y.is_finite() && self.position[1] < world.recovery_min_y - 15.0)
             || !self.position.iter().all(|x| x.is_finite())
@@ -4052,13 +4321,17 @@ impl Player {
     }
 }
 impl Player {
-    /// Implemented character-context subset: ground0, jumping1, airborne2.
-    /// Other native states require their actual action/lifecycle integration.
+    /// Retail hkpCharacterState IDs: ground 0, jumping 1, airborne 2,
+    /// damaged leap 6, ledge grab 8, knockback 10.
     pub fn motion_state(&self) -> i32 {
         if self.native_knockback {
             10
-        } else if self.damage_leaping {
+        } else if self.ledge.is_active() {
             8
+        } else if self.damage_leaping {
+            6
+        } else if self.sliding_animation_active {
+            3
         } else if self.jump_stage.is_some() {
             1
         } else if self.grounded || self.stairs_ground_retained {

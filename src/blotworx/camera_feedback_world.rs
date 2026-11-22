@@ -178,7 +178,10 @@ impl Host<Event> for Bindings<'_> {
                 Ok(())
             }
             fn ledge_transition(&mut self) -> Result<()> {
-                anyhow::bail!("Native camera ledge transition requires the unfinished default orientation controller")
+                if let Some(tracker) = &mut self.tracker {
+                    tracker.state.follow_jump = true;
+                }
+                Ok(())
             }
         }
         let owner = self

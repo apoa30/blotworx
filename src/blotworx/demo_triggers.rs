@@ -397,8 +397,50 @@ impl World {
                             continue;
                         }
                     }
+                    if let Some(layers) = component_value("Collidable Collision Layers")
+                        .and_then(|v| v.as_array())
+                        .filter(|v| !v.is_empty())
+                    {
+                        let player_layer = self
+                            .player_physics
+                            .as_ref()
+                            .and_then(|body| self.collision.simulation_filter(body.shape))
+                            .map(|word| word & 31)
+                            .or_else(|| {
+                                value(
+                                    &self.entities[self.player_entity],
+                                    "PhysicsRigidBodyCharacterComponent",
+                                    "Collision Layer",
+                                )
+                                .and_then(|v| v.as_u64())
+                                .and_then(|v| u32::try_from(v).ok())
+                            });
+                        if let Some(layer) = player_layer {
+                            let bit = if layer < 32 { 1u32 << layer } else { 0 };
+                            let admitted_layer = layers
+                                .iter()
+                                .filter_map(|v| v.as_u64())
+                                .filter_map(|v| u32::try_from(v).ok())
+                                .any(|selector| super::trigger_damage::layer_mask(selector) & bit != 0);
+                            if !admitted_layer {
+                                continue;
+                            }
+                        }
+                    }
                     let visit = state.visits.entry((entity, index)).or_default();
                     let plane = class == "TriggerPlaneComponent";
+                    let midair_platform_jump = class == "TriggerVolumeComponent"
+                        && self.script_player_available
+                        && !self.script_player.grounded
+                        && !self.script_player.stairs_ground_retained
+                        && !self.script_player.ledge.is_active()
+                        && (self.script_player.jump_stage.is_some()
+                            || self
+                                .script_player
+                                .motion_ground
+                                .as_ref()
+                                .and_then(|g| g.distance)
+                                .is_some_and(|d| d <= 4.5));
                     let (inside, entered, forward) = if plane {
                         let center = e.transform[12..15].try_into()?;
                         let current = local(
@@ -429,6 +471,8 @@ impl World {
                         visit.previous = Some(current);
                         (false, crossed, previous.is_some_and(|previous|
                             super::trigger_plane_segment::forward(previous[2], current[2])))
+                    } else if midair_platform_jump {
+                        (visit.inside, false, true)
                     } else {
                         let inside = self.demo_contains(entity, position)?.unwrap_or(false);
                         (inside, inside && !visit.inside, true)

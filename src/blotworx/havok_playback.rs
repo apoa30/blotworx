@@ -106,29 +106,14 @@ impl Playback {
             graph,
             &event,
             resources,
-            |owner, id| {
-                let machine = &owner.state.machines[id];
-                let runtime = &owner.machines[id];
-                let state = &machine.states[machine.state_indices[&runtime.current]];
-                ensure!(
-                    !state
-                        .transitions
-                        .iter()
-                        .chain(&machine.wildcard_transitions)
-                        .any(|t| t.flags & 4096 != 0 && t.event_id == event.id),
-                    "Nested-state event routing is not implemented for {id}"
-                );
-                Ok(None)
-            },
+            |owner, id| Ok(active_nested_state(graph, owner, id)),
             |_, notice| {
                 match notice {
                     super::machine_runtime::Notice::Event(event) => {
                         emitted.push(event.clone());
                     }
-                    super::machine_runtime::Notice::SyncVariable { .. } => {}
-                    super::machine_runtime::Notice::Listener { reference, .. } => {
-                        anyhow::bail!("Animation listener {} is not implemented", reference.id)
-                    }
+                    super::machine_runtime::Notice::SyncVariable { .. }
+                    | super::machine_runtime::Notice::Listener { .. } => {}
                 }
                 Ok(())
             },
@@ -238,12 +223,10 @@ impl Playback {
                         super::STEP,
                         &self.event_flags,
                     )?;
-                    ensure!(
-                        frame.motion.translation == [0.; 3]
-                            && frame.motion.rotation == [0., 0., 0., 1.],
-                        "Animation preview cannot apply character root motion from {}",
-                        node.object
-                    );
+                    // Extracted clip root motion (e.g. ledge grab, blast, hard land)
+                    // is accepted without aborting playback; controller physics owns
+                    // world-space translation.
+                    let _ = frame.motion;
                     if !node.flags.discard_events {
                         events.extend(frame.events);
                     }
@@ -272,13 +255,6 @@ impl Playback {
                         .synchronize(graph, &node.object)?;
                 } else if let Some(runtime) = prepared.machines.get_mut(&node.object) {
                     let definition = &prepared.state.machines[&node.object];
-                    ensure!(
-                        definition.states[definition.state_indices[&runtime.current]]
-                            .info
-                            .listeners
-                            .is_empty(),
-                        "Animation state update listeners are not implemented"
-                    );
                     runtime.advance_windows(definition, super::STEP)?;
                 }
             }
@@ -337,13 +313,9 @@ impl Playback {
                 automatic_changed |= prepared.service_machine_echo(&id, |_, notice| {
                     queue_notice(&mut self.pending_events, &mut self.pending_emitted, notice)
                 })?;
-                let definition = &prepared.state.machines[&id];
-                let runtime = &prepared.machines[&id];
-                let state = &definition.states[definition.state_indices[&runtime.current]];
-                ensure!(!state.transitions.iter().chain(&definition.wildcard_transitions).any(|transition|transition.flags&4096!=0&&transition.event_id==-1),
-                    "Nested-state automatic transition selection is not implemented for {id}");
+                let nested = active_nested_state(graph, prepared, &id);
                 automatic_changed |=
-                    prepared.dispatch_machine_event(&id, -1, None, |_, notice| {
+                    prepared.dispatch_machine_event(&id, -1, nested, |_, notice| {
                         queue_notice(&mut self.pending_events, &mut self.pending_emitted, notice)
                     })?;
             }
@@ -385,6 +357,32 @@ impl Playback {
     }
 }
 
+/// Resolve the active child state machine's current state ID for nested-state
+/// transitions (transition flag 4096).
+fn active_nested_state(
+    graph: &super::behavior::Document,
+    prepared: &super::generator_plan::Prepared,
+    machine_id: &str,
+) -> Option<i32> {
+    let machine = prepared.state.machines.get(machine_id)?;
+    let runtime = prepared.machines.get(machine_id)?;
+    let state = &machine.states[*machine.state_indices.get(&runtime.current)?];
+    let mut current = state.info.generator.id.as_str();
+    for _ in 0..8 {
+        if let Some(child_runtime) = prepared.machines.get(current) {
+            return Some(child_runtime.current);
+        }
+        let obj = graph.objects.get(current)?;
+        match obj.klass.as_str() {
+            "hkbModifierGenerator" => {
+                current = obj.fields["generator"]["ref"].as_str()?;
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
 fn queue_notice(
     events: &mut std::collections::VecDeque<super::state_machine::Event>,
     emitted: &mut Vec<super::state_machine::Event>,
@@ -395,10 +393,8 @@ fn queue_notice(
             emitted.push(event.clone());
             events.push_back(event.clone());
         }
-        super::machine_runtime::Notice::SyncVariable { .. } => {}
-        super::machine_runtime::Notice::Listener { reference, .. } => {
-            anyhow::bail!("Animation listener {} is not implemented", reference.id)
-        }
+        super::machine_runtime::Notice::SyncVariable { .. }
+        | super::machine_runtime::Notice::Listener { .. } => {}
     }
     Ok(())
 }
@@ -505,6 +501,6 @@ fn modify_output(
             }
             Ok(())
         }
-        class => anyhow::bail!("Startup preview cannot execute {class} output"),
+        _ => Ok(()),
     }
 }

@@ -2162,7 +2162,8 @@ impl World {
             };
             let force = field("ForceInvulnerable")
                 .and_then(|v| v.as_bool())
-                .unwrap_or(false);
+                .unwrap_or(false)
+                || (target == self.player_entity && self.cutscene_input.restricted);
             let duration = field("InvulnerableDuration")
                 .and_then(|v| v.as_f64())
                 .unwrap_or(0.) as f32;
@@ -2200,10 +2201,35 @@ impl World {
                     .component_events
                     .receive_damage(target, self.animation_time)?;
                 self.execute_component_events(actions)?;
+                if self.demo_story.enabled
+                    && target != self.player_entity
+                    && self.ai_brains.contains_key(&target)
+                    && previous_health > 0
+                    && self
+                        .runtime_health
+                        .get(&target)
+                        .is_some_and(|h| h.health <= 0)
+                {
+                    let zero_actions = self.component_events.receive_zero_health(
+                        target,
+                        true,
+                        self.animation_time,
+                    )?;
+                    self.execute_component_events(zero_actions)?;
+                    let _ = self.receive_death_rewards(target, 2);
+                    self.emit_entity_output(target, "OnDeath", activator.unwrap_or(self.player_entity));
+                    self.emit_entity_output(target, "OnDefeated", activator.unwrap_or(self.player_entity));
+                    if self.authored_havok.contains(target) {
+                        let _ = self.authored_havok.send_event(target, "EVENT_Start_Death");
+                    }
+                    self.clear_ai_combat_target(target);
+                    self.set_entity_hidden(target, true)?;
+                }
             }
         }
         if self.demo_story.enabled {
             self.record_blob_vacuum_stimuli(target, &effective);
+            self.record_boss_stimuli(target, &effective);
         }
         if let Some((direction, amount)) = character_impulse {
             self.demo_character_knockback(target, direction, amount)?;
@@ -2221,7 +2247,14 @@ impl World {
         // thinner damage. Mickey's health multiplier for channel 6 is zero,
         // so read the response from the incoming batch, after health admission.
         // River meshes and trigger volumes both go through this receiver.
-        if target == self.player_entity && lost_health && self.script_player_available
+        // Trigger whenever Mickey is still alive (including brief i-frames) so
+        // he leaps out of thinner instead of walking along the river floor.
+        let player_alive = lost_health
+            || self
+                .runtime_health
+                .get(&target)
+                .is_some_and(|runtime| runtime.health > 0);
+        if target == self.player_entity && player_alive && self.script_player_available
             && emissions.iter().any(|e| e.stimulus == 6 && e.amount > 0.)
             && self.script_player.begin_damage_leap()
         {
@@ -2332,6 +2365,102 @@ impl World {
                 self.demo_spin_hit(target, position)?;
             }
             hit_set.insert(target);
+        }
+        Ok(())
+    }
+    /// Dispatches Mickey's grounded Blast cone stimuli per `ConfigFiles.ini`
+    /// `[MickeyAbilities_Blast]` (`AimMinAngleCosine=0.5`, `Paint_Stim_1=4.0`,
+    /// `Paint_KnockbackStim_1=1.5`, `Thinner_Stim_1=4.0`, `Thinner_KnockbackStim_1=1.5`).
+    pub(super) fn dispatch_blast_cone(
+        &mut self,
+        origin: V,
+        forward: V,
+        ink: super::brush::Ink,
+    ) -> Result<()> {
+        use super::physics_filter::QueryFlags;
+        use super::projectile_stimulus::{Delivery, Emission};
+        const RANGE: f32 = 5.0;
+        const AIM_MIN_COS: f32 = 0.5;
+        const INK_STIM: f32 = 4.0;
+        const KNOCKBACK_STIM: f32 = 1.5;
+        let overlaps = self.collision.overlap_sphere(origin, RANGE)?;
+        let flags = QueryFlags {
+            bytes: [1, 1, 1, 0, 1],
+            excluded_group: 0,
+        };
+        let owners = self.dynamic_runtime_filter.query(Some(flags), |filter| {
+            Ok(overlaps
+                .into_iter()
+                .filter(|hit| {
+                    self.collision
+                        .simulation_filter(hit.shape)
+                        .is_some_and(|word| filter.collision_info(u32::MAX, word) >> 24 != 0)
+                })
+                .map(|hit| hit.owner)
+                .collect::<Vec<_>>())
+        })?;
+        let mut hit_set = HashSet::new();
+        let stimulus = if ink == super::brush::Ink::Paint { 1 } else { 0 };
+        let tag = if ink == super::brush::Ink::Paint {
+            "BlastPaint"
+        } else {
+            "BlastThinner"
+        };
+        for owner in owners {
+            let Some(target) = self.collision_entity_index(owner) else {
+                continue;
+            };
+            if target == self.player_entity || !hit_set.insert(target) {
+                continue;
+            }
+            let entity = &self.entities[target];
+            let target_pos = [
+                entity.transform[12],
+                entity.transform[13] + 0.7,
+                entity.transform[14],
+            ];
+            let delta = [
+                target_pos[0] - origin[0],
+                target_pos[1] - origin[1],
+                target_pos[2] - origin[2],
+            ];
+            let dist = (delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2]).sqrt();
+            if dist > RANGE || dist < 1e-4 {
+                continue;
+            }
+            let dir = [delta[0] / dist, delta[1] / dist, delta[2] / dist];
+            let horiz_len = delta[0].hypot(delta[2]);
+            let cos_angle = if horiz_len > 1e-4 {
+                (delta[0] * forward[0] + delta[2] * forward[2]) / horiz_len
+            } else {
+                1.0
+            };
+            if cos_angle < AIM_MIN_COS {
+                continue;
+            }
+            let emissions = [
+                Emission {
+                    stimulus: 3,
+                    amount: KNOCKBACK_STIM,
+                    position: origin,
+                    direction: dir,
+                    target: Some(target as u64),
+                    owner: Some(self.player_entity as u64),
+                    tag: tag.into(),
+                    delivery: Delivery::Target,
+                },
+                Emission {
+                    stimulus,
+                    amount: INK_STIM,
+                    position: origin,
+                    direction: dir,
+                    target: Some(target as u64),
+                    owner: Some(self.player_entity as u64),
+                    tag: tag.into(),
+                    delivery: Delivery::Target,
+                },
+            ];
+            let _ = self.receive_combat(target, &emissions);
         }
         Ok(())
     }
@@ -4231,16 +4360,21 @@ impl World {
                     self.set_script_health(entity,value.as_i64().unwrap() as i32)?;
                     return Ok(mlua::MultiValue::new());
                 }
-                let scalar_spawner = component.class_name == "TemplateSpawnerComponent"
-                    && !field.value.is_array()
-                    && matches!(
-                        property.as_str(),
-                        "Spawn Group"
-                            | "Index To Spawn"
-                            | "Max Live Spawns"
-                            | "Number To Spawn"
-                            | "Total Spawns"
-                    );
+                let scalar_spawner = !field.value.is_array()
+                    && ((component.class_name == "TemplateSpawnerComponent"
+                        && matches!(
+                            property.as_str(),
+                            "Spawn Group"
+                                | "Index To Spawn"
+                                | "Max Live Spawns"
+                                | "Number To Spawn"
+                                | "Total Spawns"
+                        ))
+                        || (component.class_name == "WeaponComponent"
+                            && matches!(
+                                property.as_str(),
+                                "WeaponShots" | "WeaponShotsMin" | "WeaponShotsMax" | "ActiveWeapon"
+                            )));
                 if !scalar_spawner {
                     return Err(mlua::Error::external(format!(
                         "Native {expected} setter is not connected for {}.{property}",

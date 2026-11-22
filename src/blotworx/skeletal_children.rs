@@ -149,7 +149,7 @@ pub fn cache(parent: Transform, bone: Pose, socket: &Socket) -> Result<Transform
 }
 pub(super) fn cache_with_point(parent:Transform,bone:Pose,socket:&Socket,point:Option<Transform>)->Result<Transform> {
     ensure!(
-        matches!(socket.mode, 0 | 1 | 3 | 4 | 5) || (socket.mode==6&&point.is_some()),
+        matches!(socket.mode, 0 | 1 | 3 | 4 | 5 | 6),
         "Native skeletal attachment mode {} is not connected",
         socket.mode
     );

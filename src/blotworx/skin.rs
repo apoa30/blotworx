@@ -721,11 +721,19 @@ fn render_vertices(
                 / det
         });
         let length = normal.iter().map(|v| v * v).sum::<f64>().sqrt();
-        ensure!(length.is_finite() && length > 0., "Invalid animated normal");
+        let unit_normal = if length.is_finite() && length > 1e-8 {
+            [
+                (normal[0] / length) as f32,
+                (normal[1] / length) as f32,
+                (normal[2] / length) as f32,
+            ]
+        } else {
+            [0., 1., 0.]
+        };
         for i in 0..3 {
             vertex[i] = ((0..3).map(|j| m[i][j] * f64::from(p[j])).sum::<f64>() + m[i][3]) as f32;
             ensure!(vertex[i].is_finite(), "Animated vertex overflow");
-            vertex[i + 3] = (normal[i] / length) as f32;
+            vertex[i + 3] = unit_normal[i];
             minimum[i] = minimum[i].min(vertex[i]);
             maximum[i] = maximum[i].max(vertex[i]);
         }

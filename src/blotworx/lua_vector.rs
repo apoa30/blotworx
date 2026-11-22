@@ -181,7 +181,7 @@ pub fn read_selector(key: &[u8]) -> Read {
         return Read::Metatable;
     };
     match key[0] {
-        b'1' | b'r' => Read::Lane(0),
+        b'1' | b'r' | b'x' => Read::Lane(0),
         b'2' | b'g' | b'y' => Read::Lane(1),
         b'3' | b'b' | b'z' => Read::Lane(2),
         b'4' | b'a' | b'w' => Read::Lane(3),

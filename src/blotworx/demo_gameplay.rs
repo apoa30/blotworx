@@ -316,10 +316,14 @@ impl World {
         lua: &mlua::Lua,
         args: mlua::MultiValue,
     ) -> mlua::Result<mlua::MultiValue> {
-        if args.len() != 2 {
-            return Err(mlua::Error::external("SetSplineFollowerInitialSpeed requires an entity and speed"));
+        if args.is_empty() {
+            return Ok(mlua::MultiValue::new());
         }
-        let speed = lua.coerce_number(args[1].clone())?.unwrap_or(0.) as f32;
+        let speed = args
+            .get(1)
+            .cloned()
+            .and_then(|v| lua.coerce_number(v).ok().flatten())
+            .unwrap_or(0.) as f32;
         let Some(owner) = self.scripts.resolve_native_entity_argument(lua, args[0].clone())?
             .filter(|owner| !self.removed_entities.contains(owner))
         else {

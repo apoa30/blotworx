@@ -190,6 +190,10 @@ impl World {
             return Ok(());
         }
         let previous_motion = player.motion_state();
+        player.ledge_gate_enabled = self
+            .ledge_controls
+            .get(&self.player_entity)
+            .is_none_or(|state| state.flags_admit_query());
         // Native308a54 publishes the fresh checkSupport result before the
         // ground record. Scene changes can invalidate last tick's support.
         let support = self
@@ -228,7 +232,7 @@ impl World {
         };
         if support == State::Supported
             || player.ground_vectors.is_none()
-            || !matches!(player.motion_state(), 0 | 2)
+            || !matches!(player.motion_state(), 0 | 2 | 3)
         {
             player.stairs_ground_retained = false;
             return Ok(());
@@ -272,7 +276,51 @@ impl World {
         };
         let shape = body.shape;
         let orientation = body.orientation;
-        if body.suspended_motion.is_some() {player.velocity=[0.;3];}
+        // Carry Mickey along moving platforms/doors while hanging on a ledge.
+        if let Some(ledge_owner) = player.ledge.active.map(|active| active.owner) {
+            if let Some(entity_idx) = self.collision_entity_index(ledge_owner) {
+                if let Ok(owner_pos) = self.entities[entity_idx].transform[12..15].try_into() {
+                    if let Some(delta) = player.ledge.carry_with_owner(owner_pos) {
+                        for i in 0..3 {
+                            player.position[i] += delta[i];
+                        }
+                    }
+                }
+            }
+        }
+        // Retail dynamic wall-pushing (PushingMaxAngle = 75 deg): when Mickey
+        // runs into a movable dynamic body on the ground, push it horizontally.
+        if player.grounded && !player.ledge.is_active() && !player.native_knockback {
+            let hspeed = player.velocity[0].hypot(player.velocity[2]);
+            let wall_push_allowed = !self.wall_pushing_disabled.contains(&self.player_entity);
+            if wall_push_allowed && hspeed > 0.5 && player.motion.pushing_max_angle > 0. {
+                let dir = [player.velocity[0] / hspeed, 0., player.velocity[2] / hspeed];
+                let probe = [player.position[0], player.position[1] + 0.5, player.position[2]];
+                if let Ok(Some(hit)) = self.collision.with_player_queries(|| {
+                    Ok::<_, anyhow::Error>(self.collision.ray_hit(probe, dir, 0.55))
+                }) {
+                    let min_cos = player.motion.pushing_max_angle.to_radians().cos();
+                    let into_dot = -(hit.normal[0] * dir[0] + hit.normal[2] * dir[2]);
+                    if into_dot >= min_cos {
+                        let is_dynamic = self.dynamic_runtime_sources.iter().any(|(src, &owner)| {
+                            owner == hit.owner
+                                && self.dynamic_constructions.get(src).is_some_and(|c| {
+                                    c.bodies.iter().any(|b| {
+                                        matches!(b.motion.current.motion_type(), 2 | 3)
+                                    })
+                                })
+                        });
+                        if is_dynamic {
+                            let impulse = [dir[0] * hspeed * dt * 2.5, 0., dir[2] * hspeed * dt * 2.5];
+                            let _ = self.collision.apply_owner_impulse(hit.owner, impulse);
+                        }
+                    }
+                }
+            }
+        }
+        if body.suspended_motion.is_some() || player.ledge.is_active() {
+            player.velocity = [0.; 3];
+        }
         if let Some((origin,normal))=player.side_scroll_plane {
             player.velocity=super::side_scroller::project(player.velocity,normal);
             let relative=super::physics::sub(player.position,origin);
@@ -292,6 +340,13 @@ impl World {
         let start = self.dynamic_runtime_time;
         self.advance_dynamic_physics(dt)?;
         let mut pose = self.collision.simulation_pose(shape)?;
+        if player.ledge.is_active() {
+            pose.position = player.position;
+            pose.linear = [0.; 3];
+            self.collision
+                .set_shape_transform(shape, player.position, orientation)?;
+            self.collision.set_simulation_velocity(shape, [0.; 3])?;
+        }
         if let Some((origin,normal))=player.side_scroll_plane {
             let relative=super::physics::sub(pose.position,origin);
             let constrained=super::physics::add(origin,super::side_scroller::project(relative,normal));
@@ -322,6 +377,75 @@ impl World {
             .set_linear_velocity([pose.linear[0], pose.linear[1], pose.linear[2], 0.]);
         self.entities[self.player_entity].transform[12..15].copy_from_slice(&pose.position);
         player.accept_physics_pose(pose);
+        // Retail NPC head-bounce (Config.ini FriendlySpatter_StompJumpHeightBonus = 2.0):
+        // when Mickey lands/descends onto another character capsule's head, bounce him upward.
+        if !player.ledge.is_active()
+            && !player.native_knockback
+            && !player.damage_leaping
+            && pose.linear[1] <= 1.0
+        {
+            let bounce_target = self.character_physics.iter().find_map(|(&npc, res)| {
+                if npc == self.player_entity
+                    || self.removed_entities.contains(&npc)
+                    || self.hidden_entities.contains(&npc)
+                {
+                    return None;
+                }
+                let npc_body = res.as_ref().ok()?;
+                let npc_pos: [f32; 3] = self.entities[npc].transform[12..15].try_into().ok()?;
+                let dx = pose.position[0] - npc_pos[0];
+                let dz = pose.position[2] - npc_pos[2];
+                let dy = pose.position[1] - npc_pos[1];
+                let head_h = npc_body.navigation_height.clamp(0.6, 2.2);
+                (dx.hypot(dz) <= 0.65 && dy >= head_h * 0.45 && dy <= head_h + 0.45)
+                    .then_some(npc)
+            });
+            if let Some(npc) = bounce_target {
+                let ai_type = self
+                    .ai_brains
+                    .get(&npc)
+                    .map(|b| b.ai_type.as_str())
+                    .unwrap_or("");
+                let is_spatter = ai_type.to_ascii_lowercase().contains("spatter");
+                let is_slobber = ai_type.to_ascii_lowercase().contains("theblob")
+                    || ai_type.to_ascii_lowercase().contains("slobber");
+                let is_kamikaze = ai_type.to_ascii_lowercase().contains("kamikaze")
+                    || ai_type.to_ascii_lowercase().contains("spladoosh");
+                let stunned = self
+                    .demo_story
+                    .ai
+                    .stunned_until
+                    .get(&npc)
+                    .is_some_and(|&until| self.animation_time < until);
+                let friendly = self.paint_counters.get(&npc).is_some_and(|c| c.status() == 1)
+                    || self.music_team(npc).is_some_and(|(team, _)| team == 3);
+                // Config.ini / ConfigFiles.ini: StunnedSpatter_StompJumpHeightBonus = 3.6,
+                // FriendlySpatter_StompJumpHeightBonus = 2.0, Spatter_StompStunDuration = 2.0,
+                // BEH_Stomped_SpatterKamikaze = 0.2, BEH_Stomped_TheBlob = 0.0.
+                let bonus = if is_spatter && stunned {
+                    3.6
+                } else if is_spatter && friendly {
+                    2.0
+                } else {
+                    if !friendly && !is_slobber {
+                        let dur = if is_kamikaze { 0.2 } else { 2.0 };
+                        self.demo_story
+                            .ai
+                            .stunned_until
+                            .insert(npc, self.animation_time + dur);
+                        let _ = self.authored_havok.send_event(npc, "EVENT_Start_Stun");
+                    }
+                    1.0
+                };
+                player.bounce_off_head(bonus);
+                self.collision
+                    .set_shape_transform(shape, player.position, orientation)?;
+                self.collision
+                    .set_simulation_velocity(shape, player.velocity)?;
+                self.entities[self.player_entity].transform[12..15]
+                    .copy_from_slice(&player.position);
+            }
+        }
         Ok(())
     }
 }
