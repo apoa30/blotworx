@@ -1,20 +1,25 @@
 //! PC-side Epic Mickey to Nintendo 3DS (.bw3d) level bundle converter.
-//! Repackages geometry, PICA200 Morton-swizzled RGBA5551 textures, collision
-//! triangles, paintable/thinnable toon flags, actors, triggers, and dialogues
-//! into compact streaming bundles constrained for the Old 3DS 128 MB RAM budget.
+//! Repackages real NIF environment geometry, skinned Mickey & actor NIF models,
+//! 128x128 PICA200 Morton-swizzled RGBA5551 textures, collision triangles,
+//! paintable/thinnable toon flags, actors, triggers, and dialogues into compact
+//! streaming bundles constrained for the Old 3DS 128 MB RAM budget.
 
 use super::assets::{RuntimeEntity, World};
 use anyhow::{Context, Result};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
 const BW3D_MAGIC: u32 = 0x4433_5742; // "BW3D"
-const BW3D_VERSION: u32 = 1;
+const BW3D_VERSION: u32 = 2;
+const TEX_DIM: usize = 128;
 
 const SUBMESH_PAINTABLE: u16 = 1 << 0;
 const SUBMESH_PAINTED: u16 = 1 << 1;
 const SUBMESH_HAZARD: u16 = 1 << 2;
+const SUBMESH_DYNAMIC: u16 = 1 << 3;
+const SUBMESH_PLAYER_MODEL: u16 = 1 << 5;
+const SUBMESH_SKYBOX: u16 = 1 << 6;
 
 const ACTOR_SPATTER: u8 = 1;
 const ACTOR_SWEEPER: u8 = 2;
@@ -28,13 +33,12 @@ const ACTOR_TRIGGER_DMG: u8 = 9;
 const ACTOR_PICKUP: u8 = 10;
 
 const TEAM_HOSTILE: u8 = 2;
-const TEAM_FRIENDLY: u8 = 3;
 const TEAM_NEUTRAL: u8 = 4;
 
-const MAX_3DS_TEXTURES: usize = 64;
-const MAX_3DS_VERTICES: usize = 28_000;
-const MAX_3DS_INDICES: usize = 84_000;
-const MAX_3DS_COLL_TRIS: usize = 6_000;
+const MAX_3DS_TEXTURES: usize = 112;
+const MAX_3DS_VERTICES: usize = 150_000;
+const MAX_3DS_INDICES: usize = 360_000;
+const MAX_3DS_COLL_TRIS: usize = 10_000;
 const MAX_3DS_ACTORS: usize = 128;
 const MAX_3DS_DIALOGUES: usize = 48;
 
@@ -58,24 +62,24 @@ fn morton_8x8(x: usize, y: usize) -> usize {
     i
 }
 
-/// Downscale RGBA8 image to 64x64 and swizzle into PICA200 8x8 Morton tiles (GPU_RGBA5551).
-fn swizzle_rgba_to_pica_64x64(rgba: &[u8], width: u32, height: u32) -> [u16; 64 * 64] {
-    let mut out = [0xFFFFu16; 64 * 64];
+/// Downscale RGBA8 image to 128x128 and swizzle into PICA200 8x8 Morton tiles (GPU_RGBA5551).
+fn swizzle_rgba_to_pica_128(rgba: &[u8], width: u32, height: u32) -> Vec<u16> {
+    let mut out = vec![0xFFFFu16; TEX_DIM * TEX_DIM];
     if width == 0 || height == 0 || rgba.len() < (width as usize * height as usize * 4) {
         return out;
     }
     let w = width as usize;
     let h = height as usize;
-    for ty in 0..8 {
-        for tx in 0..8 {
-            let tile_base = (ty * 8 + tx) * 64;
+    let tiles = TEX_DIM / 8;
+    for ty in 0..tiles {
+        for tx in 0..tiles {
+            let tile_base = (ty * tiles + tx) * 64;
             for py in 0..8 {
                 for px in 0..8 {
                     let dst_x = tx * 8 + px;
                     let dst_y = ty * 8 + py;
-                    // Flip Y for PICA200 texture coordinates
-                    let src_x = (dst_x * w / 64).min(w - 1);
-                    let src_y = ((63 - dst_y) * h / 64).min(h - 1);
+                    let src_x = (dst_x * w / TEX_DIM).min(w - 1);
+                    let src_y = (((TEX_DIM - 1 - dst_y) * h) / TEX_DIM).min(h - 1);
                     let idx = (src_y * w + src_x) * 4;
                     let r = (rgba[idx] >> 3) as u16;
                     let g = (rgba[idx + 1] >> 3) as u16;
@@ -169,13 +173,142 @@ pub fn export_world_to_bw3d(world: &World, output_path: &Path) -> Result<()> {
         std::fs::create_dir_all(parent)?;
     }
 
-    let spawn = world.report.spawn;
+    let mut draws = world.draws.clone();
+    let _ = world.apply_model_geometry(&mut draws);
+    let _ = world.apply_model_materials(&mut draws);
+
+    let player_ent = world.player_entity;
+    let player_pos = [
+        world.entities[player_ent].transform[12],
+        world.entities[player_ent].transform[13],
+        world.entities[player_ent].transform[14],
+    ];
+    let spawn = if player_pos.iter().all(|v| v.is_finite()) && player_pos != [0.0; 3] {
+        player_pos
+    } else {
+        world.report.spawn
+    };
     let spawn_yaw = 0.0f32;
 
-    // Map entity index -> draw ownership and paint/hazard flags
+    // 1. Build Dialogues & Actors first so we know which entities are dynamic actors
+    #[repr(C, packed)]
+    struct RawDialogue {
+        speaker: [u8; 32],
+        text: [u8; 128],
+    }
+
+    #[repr(C, packed)]
+    struct RawActor {
+        kind: u8,
+        team: u8,
+        hp: i16,
+        max_hp: i16,
+        dialogue_id: i16,
+        pos: [f32; 3],
+        yaw: f32,
+        half_extents: [f32; 3],
+        patrol_pos: [f32; 3],
+        paint_val: f32,
+        paint_thresh: f32,
+        thin_thresh: f32,
+        name: [u8; 32],
+    }
+
+    let mut dialogues: Vec<RawDialogue> = Vec::new();
+    dialogues.push(RawDialogue {
+        speaker: fixed_bytes("Gremlin Gus"),
+        text: fixed_bytes(&format!(
+            "Welcome to {}! Use R for Paint, L for Thinner, Y to Spin, X for Blast, and touch to aim!",
+            world.report.level
+        )),
+    });
+
+    let mut actors: Vec<RawActor> = Vec::new();
+    let mut ent_to_actor: HashMap<usize, (u16, [f32; 3])> = HashMap::new();
+
+    for (ent_idx, ent) in world.entities.iter().enumerate() {
+        if ent_idx == player_ent || actors.len() >= MAX_3DS_ACTORS || world.removed_entities.contains(&ent_idx) {
+            continue;
+        }
+        let Some((kind, team)) = classify_entity_actor(ent) else {
+            continue;
+        };
+        let pos = [ent.transform[12], ent.transform[13], ent.transform[14]];
+        if pos.iter().any(|v| !v.is_finite()) {
+            continue;
+        }
+        let hp = world
+            .runtime_health
+            .get(&ent_idx)
+            .map(|h| h.health.clamp(1, 100) as i16)
+            .unwrap_or(if kind == ACTOR_BOSS { 12 } else { 3 });
+        let dlg_id = if matches!(kind, ACTOR_NPC | ACTOR_TRIGGER_VOL) {
+            if dialogues.len() < MAX_3DS_DIALOGUES {
+                let id = dialogues.len() as i16;
+                dialogues.push(RawDialogue {
+                    speaker: fixed_bytes(&ent.name),
+                    text: fixed_bytes(&format!(
+                        "{}: Explore {} with Paint (R) and Thinner (L)!",
+                        ent.name, world.report.level
+                    )),
+                });
+                id
+            } else {
+                0
+            }
+        } else {
+            -1
+        };
+        let actor_id = actors.len() as u16;
+        actors.push(RawActor {
+            kind,
+            team,
+            hp,
+            max_hp: hp,
+            dialogue_id: dlg_id,
+            pos,
+            yaw: 0.0,
+            half_extents: [2.2, 2.0, 2.2],
+            patrol_pos: [pos[0] + 2.5, pos[1], pos[2]],
+            paint_val: 0.0,
+            paint_thresh: 3.0,
+            thin_thresh: 3.0,
+            name: fixed_bytes(&ent.name),
+        });
+        ent_to_actor.insert(ent_idx, (actor_id, pos));
+    }
+
+    // Also associate child entities (like mk_hose_nozzle or Beetleworx shells / Gremlin wrenches) with their root parent
+    let mut player_entities: HashSet<usize> = HashSet::from([player_ent]);
+    for (&child, local) in &world.transform_hierarchy {
+        let mut p = local.parent;
+        for _ in 0..8 {
+            if p == player_ent {
+                player_entities.insert(child);
+                break;
+            }
+            if let Some(&(act_id, act_pos)) = ent_to_actor.get(&p) {
+                ent_to_actor.insert(child, (act_id, act_pos));
+                break;
+            }
+            if let Some(next) = world.transform_hierarchy.get(&p) {
+                p = next.parent;
+            } else {
+                break;
+            }
+        }
+    }
+
+    // Map draw index -> entity owner
     let mut draw_owner: HashMap<usize, usize> = HashMap::new();
     for (ent_idx, ent) in world.entities.iter().enumerate() {
-        if world.removed_entities.contains(&ent_idx) || world.hidden_entities.contains(&ent_idx) {
+        if world.removed_entities.contains(&ent_idx) {
+            continue;
+        }
+        // Always export Mickey's draws and active scene entities
+        if !player_entities.contains(&ent_idx)
+            && (world.hidden_entities.contains(&ent_idx) || !world.entity_scene_active(ent_idx))
+        {
             continue;
         }
         for d in ent.draws.clone() {
@@ -183,20 +316,36 @@ pub fn export_world_to_bw3d(world: &World, output_path: &Path) -> Result<()> {
         }
     }
 
-    // Collect and sort candidate draws by distance to spawn (prioritizing paintable/toon meshes)
-    let mut candidate_draws: Vec<(usize, f32, u16)> = Vec::new();
-    for (d_idx, draw) in world.draws.iter().enumerate() {
-        if draw.skybox || draw.projected_shadow || world.hidden_entity_draws.contains(&d_idx) {
+    // Collect candidate draws
+    let mut candidate_draws: Vec<(usize, f32, u16, u16, [f32; 3])> = Vec::new();
+    for (d_idx, draw) in draws.iter().enumerate() {
+        if draw.projected_shadow || world.hidden_entity_draws.contains(&d_idx) {
             continue;
         }
         let v_count = draw.v_data.len() / 12;
-        if v_count == 0 || draw.indices.len() < 3 || v_count > 8000 {
+        if v_count == 0 || draw.indices.len() < 3 || v_count > 30_000 {
             continue;
         }
+        let Some(&ent_idx) = draw_owner.get(&d_idx) else {
+            continue;
+        };
+        let ent = &world.entities[ent_idx];
+        let lower = ent.name.to_ascii_lowercase();
+
         let mut flags = SUBMESH_PAINTED;
-        if let Some(&ent_idx) = draw_owner.get(&d_idx) {
-            let ent = &world.entities[ent_idx];
-            let lower = ent.name.to_ascii_lowercase();
+        let mut actor_id = 0u16;
+        let mut origin_offset = [0.0f32; 3];
+
+        if player_entities.contains(&ent_idx) {
+            flags |= SUBMESH_PLAYER_MODEL;
+            origin_offset = player_pos;
+        } else if let Some(&(act_id, act_pos)) = ent_to_actor.get(&ent_idx) {
+            flags |= SUBMESH_DYNAMIC;
+            actor_id = act_id;
+            origin_offset = act_pos;
+        } else if draw.skybox {
+            flags |= SUBMESH_SKYBOX;
+        } else {
             let is_paintable = ent.components.iter().any(|c| {
                 matches!(
                     c.class_name.as_str(),
@@ -220,6 +369,7 @@ pub fn export_world_to_bw3d(world: &World, output_path: &Path) -> Result<()> {
                 flags |= SUBMESH_HAZARD;
             }
         }
+
         let local_center = [
             (draw.aabb_min[0] + draw.aabb_max[0]) * 0.5,
             (draw.aabb_min[1] + draw.aabb_max[1]) * 0.5,
@@ -230,18 +380,21 @@ pub fn export_world_to_bw3d(world: &World, output_path: &Path) -> Result<()> {
         let dy = center[1] - spawn[1];
         let dz = center[2] - spawn[2];
         let mut score = dx * dx + dy * dy + dz * dz;
-        if flags & SUBMESH_PAINTABLE != 0 {
-            score *= 0.25; // Keep paintable toon geometry highest priority
+        if flags & (SUBMESH_PLAYER_MODEL | SUBMESH_DYNAMIC | SUBMESH_SKYBOX) != 0 {
+            score = -1000.0; // Always include Mickey, actors, and skybox first!
+        } else if flags & SUBMESH_PAINTABLE != 0 {
+            score *= 0.25;
         }
-        candidate_draws.push((d_idx, score, flags));
+        candidate_draws.push((d_idx, score, flags, actor_id, origin_offset));
     }
     candidate_draws.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
 
-    let mut textures: Vec<[u16; 64 * 64]> = Vec::new();
+    let mut textures: Vec<Vec<u16>> = Vec::new();
     let mut tex_map: HashMap<usize, i16> = HashMap::new();
 
     #[repr(C, packed)]
     struct RawSubmesh {
+        base_vertex: u32,
         first_index: u32,
         index_count: u32,
         tex_id: i16,
@@ -275,37 +428,38 @@ pub fn export_world_to_bw3d(world: &World, output_path: &Path) -> Result<()> {
     let mut indices: Vec<u16> = Vec::new();
     let mut coll_tris: Vec<RawCollTri> = Vec::new();
 
-    for (d_idx, _, flags) in candidate_draws {
-        let draw = &world.draws[d_idx];
+    for (d_idx, _, flags, actor_id, origin_offset) in candidate_draws {
+        let draw = &draws[d_idx];
         let v_count = draw.v_data.len() / 12;
-        // Decimate step if large mesh
-        if vertices.len() + v_count > MAX_3DS_VERTICES || indices.len() + draw.indices.len() > MAX_3DS_INDICES {
+        if v_count > 65000
+            || vertices.len() + v_count > MAX_3DS_VERTICES
+            || indices.len() + draw.indices.len() > MAX_3DS_INDICES
+        {
             continue;
         }
 
-        let tex_id = if let Some((rgba, w, h)) = &draw.tex_bytes {
+        // Select the primary diffuse texture (prefer draw.tex_bytes, then largest non-empty MaterialImage >= 32px)
+        let best_img = draw
+            .tex_bytes
+            .as_ref()
+            .filter(|(rgba, w, h)| !rgba.is_empty() && *w > 0 && *h > 0)
+            .map(|(rgba, w, h)| (rgba, *w, *h))
+            .or_else(|| {
+                draw.material_images
+                    .iter()
+                    .filter(|img| !img.rgba.is_empty() && img.width >= 32 && img.height >= 32)
+                    .max_by_key(|img| img.width * img.height)
+                    .or_else(|| draw.material_images.iter().find(|img| !img.rgba.is_empty()))
+                    .map(|img| (&img.rgba, img.width, img.height))
+            });
+
+        let tex_id = if let Some((rgba, w, h)) = best_img {
             let key = std::sync::Arc::as_ptr(rgba) as usize;
             if let Some(&existing) = tex_map.get(&key) {
                 existing
             } else if textures.len() < MAX_3DS_TEXTURES {
                 let id = textures.len() as i16;
-                textures.push(swizzle_rgba_to_pica_64x64(rgba, *w, *h));
-                tex_map.insert(key, id);
-                id
-            } else {
-                -1
-            }
-        } else if let Some(first_img) = draw.material_images.first() {
-            let key = std::sync::Arc::as_ptr(&first_img.rgba) as usize;
-            if let Some(&existing) = tex_map.get(&key) {
-                existing
-            } else if textures.len() < MAX_3DS_TEXTURES {
-                let id = textures.len() as i16;
-                textures.push(swizzle_rgba_to_pica_64x64(
-                    &first_img.rgba,
-                    first_img.width,
-                    first_img.height,
-                ));
+                textures.push(swizzle_rgba_to_pica_128(rgba, w, h));
                 tex_map.insert(key, id);
                 id
             } else {
@@ -315,7 +469,7 @@ pub fn export_world_to_bw3d(world: &World, output_path: &Path) -> Result<()> {
             -1
         };
 
-        let base_vert = vertices.len() as u16;
+        let base_vertex = vertices.len() as u32;
         let first_index = indices.len() as u32;
         let mut aabb_min = [f32::INFINITY; 3];
         let mut aabb_max = [f32::NEG_INFINITY; 3];
@@ -327,35 +481,38 @@ pub fn export_world_to_bw3d(world: &World, output_path: &Path) -> Result<()> {
                 aabb_min[axis] = aabb_min[axis].min(wp[axis]);
                 aabb_max[axis] = aabb_max[axis].max(wp[axis]);
             }
+            let pos = [
+                wp[0] - origin_offset[0],
+                wp[1] - origin_offset[1],
+                wp[2] - origin_offset[2],
+            ];
             let r = (chunk[8].clamp(0.0, 1.0) * draw.color[0].clamp(0.0, 1.0) * 255.0) as u8;
             let g = (chunk[9].clamp(0.0, 1.0) * draw.color[1].clamp(0.0, 1.0) * 255.0) as u8;
             let b = (chunk[10].clamp(0.0, 1.0) * draw.color[2].clamp(0.0, 1.0) * 255.0) as u8;
             let a = (chunk[11].clamp(0.0, 1.0) * draw.color[3].clamp(0.0, 1.0) * 255.0) as u8;
             vertices.push(RawVertex {
-                pos: wp,
+                pos,
                 uv: [chunk[6], chunk[7]],
-                rgba: [r.max(32), g.max(32), b.max(32), a.max(128)],
+                rgba: [r.max(48), g.max(48), b.max(48), a.max(180)],
                 nrm: wn,
             });
         }
 
         let submesh_id = submeshes.len() as i16;
+        let is_env = flags & (SUBMESH_PLAYER_MODEL | SUBMESH_DYNAMIC | SUBMESH_SKYBOX) == 0;
         for tri in draw.indices.chunks_exact(3) {
             let (i0, i1, i2) = (tri[0] as usize, tri[1] as usize, tri[2] as usize);
             if i0 >= v_count || i1 >= v_count || i2 >= v_count {
                 continue;
             }
-            let idx0 = base_vert + i0 as u16;
-            let idx1 = base_vert + i1 as u16;
-            let idx2 = base_vert + i2 as u16;
-            indices.push(idx0);
-            indices.push(idx1);
-            indices.push(idx2);
+            indices.push(i0 as u16);
+            indices.push(i1 as u16);
+            indices.push(i2 as u16);
 
-            if coll_tris.len() < MAX_3DS_COLL_TRIS {
-                let p0 = vertices[idx0 as usize].pos;
-                let p1 = vertices[idx1 as usize].pos;
-                let p2 = vertices[idx2 as usize].pos;
+            if is_env && coll_tris.len() < MAX_3DS_COLL_TRIS {
+                let p0 = vertices[base_vertex as usize + i0].pos;
+                let p1 = vertices[base_vertex as usize + i1].pos;
+                let p2 = vertices[base_vertex as usize + i2].pos;
                 let e1 = [p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]];
                 let e2 = [p2[0] - p0[0], p2[1] - p0[1], p2[2] - p0[2]];
                 let nx = e1[1] * e2[2] - e1[2] * e2[1];
@@ -363,7 +520,10 @@ pub fn export_world_to_bw3d(world: &World, output_path: &Path) -> Result<()> {
                 let nz = e1[0] * e2[1] - e1[1] * e2[0];
                 let len = (nx * nx + ny * ny + nz * nz).sqrt();
                 if len > 0.05 {
-                    let normal = [nx / len, ny / len, nz / len];
+                    let mut normal = [nx / len, ny / len, nz / len];
+                    if normal[1] < -0.35 {
+                        normal = [-normal[0], -normal[1], -normal[2]];
+                    }
                     if normal[1] >= 0.30 {
                         coll_tris.push(RawCollTri {
                             v0: p0,
@@ -381,11 +541,12 @@ pub fn export_world_to_bw3d(world: &World, output_path: &Path) -> Result<()> {
         let index_count = (indices.len() as u32) - first_index;
         if index_count > 0 {
             submeshes.push(RawSubmesh {
+                base_vertex,
                 first_index,
                 index_count,
                 tex_id,
                 flags,
-                actor_id: 0,
+                actor_id,
                 jigsaw_piece: 0,
                 aabb_min,
                 aabb_max,
@@ -414,90 +575,6 @@ pub fn export_world_to_bw3d(world: &World, output_path: &Path) -> Result<()> {
         });
     }
 
-    // Export Dialogues & Actors
-    #[repr(C, packed)]
-    struct RawDialogue {
-        speaker: [u8; 32],
-        text: [u8; 128],
-    }
-
-    #[repr(C, packed)]
-    struct RawActor {
-        kind: u8,
-        team: u8,
-        hp: i16,
-        max_hp: i16,
-        dialogue_id: i16,
-        pos: [f32; 3],
-        yaw: f32,
-        half_extents: [f32; 3],
-        patrol_pos: [f32; 3],
-        paint_val: f32,
-        paint_thresh: f32,
-        thin_thresh: f32,
-        name: [u8; 32],
-    }
-
-    let mut dialogues: Vec<RawDialogue> = Vec::new();
-    dialogues.push(RawDialogue {
-        speaker: fixed_bytes("Gremlin Gus"),
-        text: fixed_bytes(&format!(
-            "Welcome to {} on Nintendo 3DS! Use R for Paint, L for Thinner, Y to Spin, and touch to aim!",
-            world.report.level
-        )),
-    });
-
-    let mut actors: Vec<RawActor> = Vec::new();
-    for (ent_idx, ent) in world.entities.iter().enumerate() {
-        if actors.len() >= MAX_3DS_ACTORS || world.removed_entities.contains(&ent_idx) {
-            continue;
-        }
-        let Some((kind, team)) = classify_entity_actor(ent) else {
-            continue;
-        };
-        let pos = [ent.transform[12], ent.transform[13], ent.transform[14]];
-        if pos.iter().any(|v| !v.is_finite()) {
-            continue;
-        }
-        let hp = world
-            .runtime_health
-            .get(&ent_idx)
-            .map(|h| h.health.clamp(1, 100) as i16)
-            .unwrap_or(if kind == ACTOR_BOSS { 12 } else { 3 });
-        let dlg_id = if matches!(kind, ACTOR_NPC | ACTOR_TRIGGER_VOL) {
-            if dialogues.len() < MAX_3DS_DIALOGUES {
-                let id = dialogues.len() as i16;
-                dialogues.push(RawDialogue {
-                    speaker: fixed_bytes(&ent.name),
-                    text: fixed_bytes(&format!(
-                        "{}: Keep painting and thinning your way through {}!",
-                        ent.name, world.report.level
-                    )),
-                });
-                id
-            } else {
-                0
-            }
-        } else {
-            -1
-        };
-        actors.push(RawActor {
-            kind,
-            team,
-            hp,
-            max_hp: hp,
-            dialogue_id: dlg_id,
-            pos,
-            yaw: 0.0,
-            half_extents: [2.2, 2.0, 2.2],
-            patrol_pos: [pos[0] + 2.5, pos[1], pos[2]],
-            paint_val: 0.0,
-            paint_thresh: 3.0,
-            thin_thresh: 3.0,
-            name: fixed_bytes(&ent.name),
-        });
-    }
-
     // Write binary .bw3d file
     let mut file = std::fs::File::create(output_path)
         .with_context(|| format!("Failed to create 3DS bundle {}", output_path.display()))?;
@@ -518,13 +595,14 @@ pub fn export_world_to_bw3d(world: &World, output_path: &Path) -> Result<()> {
     header.extend_from_slice(&(coll_tris.len() as u32).to_le_bytes());
     header.extend_from_slice(&(actors.len() as u32).to_le_bytes());
     header.extend_from_slice(&(dialogues.len() as u32).to_le_bytes());
-    header.extend_from_slice(&[0u8; 20]); // reserved[5]
+    header.extend_from_slice(&[0u8; 8]); // reserved[2]
     debug_assert_eq!(header.len(), 128);
     file.write_all(&header)?;
 
+    let dim_u16 = TEX_DIM as u16;
     for tex in &textures {
-        file.write_all(&64u16.to_le_bytes())?;
-        file.write_all(&64u16.to_le_bytes())?;
+        file.write_all(&dim_u16.to_le_bytes())?;
+        file.write_all(&dim_u16.to_le_bytes())?;
         for &px in tex {
             file.write_all(&px.to_le_bytes())?;
         }
@@ -598,7 +676,11 @@ pub fn export_bundle_cli(data_root: &Path, output_dir: &Path, levels: &[String])
             .with_context(|| format!("Failed to load {level} for 3DS export"))?;
         let _ = world.enable_demo_story();
         let _ = world.prepare_gameplay_scene_requests();
-        let _ = world.advance_models(0.);
+        let mut player = world.take_startup_player();
+        let _ = world.attach_player_body();
+        for tick in 1..=15 {
+            let _ = world.advance_player_models(&mut player, tick as f32 * super::STEP);
+        }
         let out_file = levels_dir.join(level_bundle_filename(level));
         export_world_to_bw3d(&world, &out_file)?;
         println!(

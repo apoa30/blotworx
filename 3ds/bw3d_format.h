@@ -4,13 +4,17 @@
 #include <stdint.h>
 
 #define BW3D_MAGIC 0x44335742u /* "BW3D" little-endian */
-#define BW3D_VERSION 1u
+#define BW3D_VERSION 2u
 
-#define SUBMESH_PAINTABLE (1u << 0)
-#define SUBMESH_PAINTED   (1u << 1)
-#define SUBMESH_HAZARD    (1u << 2)
-#define SUBMESH_DYNAMIC   (1u << 3)
-#define SUBMESH_INERT     (1u << 4)
+#define BW3D_TEX_DIM 128u
+
+#define SUBMESH_PAINTABLE    (1u << 0)
+#define SUBMESH_PAINTED      (1u << 1)
+#define SUBMESH_HAZARD       (1u << 2)
+#define SUBMESH_DYNAMIC      (1u << 3)
+#define SUBMESH_INERT        (1u << 4)
+#define SUBMESH_PLAYER_MODEL (1u << 5)
+#define SUBMESH_SKYBOX       (1u << 6)
 
 #define ACTOR_PROP         0u
 #define ACTOR_SPATTER      1u
@@ -45,16 +49,17 @@ typedef struct {
     uint32_t num_coll_tris;
     uint32_t num_actors;
     uint32_t num_dialogues;
-    uint32_t reserved[5];
-} Bw3dHeader;
+    uint32_t reserved[2];
+} Bw3dHeader; /* 128 bytes */
 
 typedef struct {
     uint16_t width;
     uint16_t height;
-    uint16_t pixels[64 * 64]; /* Pre-swizzled PICA200 Morton 8x8 RGBA5551 */
+    uint16_t pixels[BW3D_TEX_DIM * BW3D_TEX_DIM]; /* Pre-swizzled PICA200 Morton 8x8 RGBA5551 (128x128) */
 } Bw3dTexture;
 
 typedef struct {
+    uint32_t base_vertex;
     uint32_t first_index;
     uint32_t index_count;
     int16_t  tex_id;

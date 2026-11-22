@@ -20,8 +20,8 @@
 #define MAX_PROJECTILES 32
 #define MAX_PARTICLES   96
 
-/* Cap heap and linear allocations to 24 MB each so Old 3DS (64 MB app region / 128 MB total) has 16+ MB free headroom */
-u32 __ctru_heap_size        = 24 * 1024 * 1024;
+/* Cap heap to 20 MB and linear allocations to 24 MB so Old 3DS (64 MB app region / 128 MB total) has 20+ MB free headroom */
+u32 __ctru_heap_size        = 20 * 1024 * 1024;
 u32 __ctru_linear_heap_size = 24 * 1024 * 1024;
 
 typedef struct {
@@ -183,7 +183,9 @@ static void spawn_projectile(const float pos[3], const float vel[3], uint8_t fro
 }
 
 static void unload_current_level(void) {
-    C3D_FrameSync();
+    if (g_level_vbo || g_textures) {
+        C3D_FrameSync();
+    }
     if (g_textures) {
         for (uint32_t i = 0; i < g_hdr.num_textures; ++i) {
             if (g_tex_valid && g_tex_valid[i]) {
@@ -269,7 +271,7 @@ static void reset_player_to_spawn(void) {
     g_player.spawn_pos[2] = g_hdr.spawn_pos[2];
     g_player.yaw = g_hdr.spawn_yaw;
     g_player.cam_yaw = g_hdr.spawn_yaw;
-    g_player.cam_pitch = 0.30f;
+    g_player.cam_pitch = 0.20f;
     g_player.hp = 5;
     g_player.max_hp = 5;
     g_player.paint = 100.0f;
@@ -324,6 +326,7 @@ static void build_builtin_fallback_level(void) {
     };
 
     for (int i = 0; i < 7; ++i) {
+        g_submeshes[i].base_vertex = 0;
         g_submeshes[i].first_index = ic;
         g_submeshes[i].index_count = 36;
         g_submeshes[i].tex_id = -1;
@@ -427,12 +430,18 @@ static void build_builtin_fallback_level(void) {
     reset_player_to_spawn();
 }
 
+static void debug_step(const char* msg) {
+    (void)msg;
+}
+
 static bool load_bw3d_level(const char* path) {
+    debug_step("STEP 1: fopen");
     FILE* f = fopen(path, "rb");
-    if (!f) return false;
+    if (!f) { debug_step("FAIL: fopen"); return false; }
 
     Bw3dHeader hdr;
     if (fread(&hdr, sizeof(Bw3dHeader), 1, f) != 1 || hdr.magic != BW3D_MAGIC || hdr.version != BW3D_VERSION) {
+        debug_step("FAIL: hdr");
         fclose(f);
         return false;
     }
@@ -441,13 +450,14 @@ static bool load_bw3d_level(const char* path) {
     unload_current_level();
     g_hdr = hdr;
 
+    debug_step("STEP 2: textures");
     if (g_hdr.num_textures > 0) {
         g_textures  = (C3D_Tex*)calloc(g_hdr.num_textures, sizeof(C3D_Tex));
         g_tex_valid = (uint8_t*)calloc(g_hdr.num_textures, 1);
         Bw3dTexture* tmp = (Bw3dTexture*)malloc(sizeof(Bw3dTexture));
         for (uint32_t i = 0; i < g_hdr.num_textures; ++i) {
             if (fread(tmp, sizeof(Bw3dTexture), 1, f) == 1) {
-                if (C3D_TexInit(&g_textures[i], 64, 64, GPU_RGBA5551)) {
+                if (C3D_TexInit(&g_textures[i], BW3D_TEX_DIM, BW3D_TEX_DIM, GPU_RGBA5551)) {
                     C3D_TexSetFilter(&g_textures[i], GPU_LINEAR, GPU_LINEAR);
                     C3D_TexSetWrap(&g_textures[i], GPU_REPEAT, GPU_REPEAT);
                     memcpy(g_textures[i].data, tmp->pixels, sizeof(tmp->pixels));
@@ -459,20 +469,26 @@ static bool load_bw3d_level(const char* path) {
         free(tmp);
     }
 
+    debug_step("STEP 3: submeshes");
     if (g_hdr.num_submeshes > 0) {
         g_submeshes = (Bw3dSubmesh*)calloc(g_hdr.num_submeshes, sizeof(Bw3dSubmesh));
         fread(g_submeshes, sizeof(Bw3dSubmesh), g_hdr.num_submeshes, f);
     }
+    debug_step("STEP 4: vbo");
     if (g_hdr.num_vertices > 0) {
         g_level_vbo = (Bw3dVertex*)linearAlloc(g_hdr.num_vertices * sizeof(Bw3dVertex));
+        if (!g_level_vbo) { debug_step("FAIL: linearAlloc VBO"); fclose(f); return false; }
         fread(g_level_vbo, sizeof(Bw3dVertex), g_hdr.num_vertices, f);
         GSPGPU_FlushDataCache(g_level_vbo, g_hdr.num_vertices * sizeof(Bw3dVertex));
     }
+    debug_step("STEP 5: ibo");
     if (g_hdr.num_indices > 0) {
         g_level_ibo = (uint16_t*)linearAlloc(g_hdr.num_indices * sizeof(uint16_t));
+        if (!g_level_ibo) { debug_step("FAIL: linearAlloc IBO"); fclose(f); return false; }
         fread(g_level_ibo, sizeof(uint16_t), g_hdr.num_indices, f);
         GSPGPU_FlushDataCache(g_level_ibo, g_hdr.num_indices * sizeof(uint16_t));
     }
+    debug_step("STEP 6: coll & actors");
     if (g_hdr.num_coll_tris > 0) {
         g_coll_tris = (Bw3dCollTri*)calloc(g_hdr.num_coll_tris, sizeof(Bw3dCollTri));
         fread(g_coll_tris, sizeof(Bw3dCollTri), g_hdr.num_coll_tris, f);
@@ -492,6 +508,7 @@ static bool load_bw3d_level(const char* path) {
 
     fclose(f);
     reset_player_to_spawn();
+    debug_step("STEP 7: level loaded OK!");
     char msg[64];
     snprintf(msg, sizeof(msg), "Loaded %.48s", g_hdr.title);
     set_status(msg, 3.5f);
@@ -901,7 +918,7 @@ static void update_simulation(float dt, u32 kDown, u32 kHeld, const circlePositi
         }
 
         /* Death fall rescue */
-        if (g_player.pos[1] < -18.0f) {
+        if (g_player.pos[1] < g_player.spawn_pos[1] - 40.0f) {
             g_player.pos[0] = g_player.spawn_pos[0];
             g_player.pos[1] = g_player.spawn_pos[1] + 0.5f;
             g_player.pos[2] = g_player.spawn_pos[2];
@@ -1216,10 +1233,10 @@ static void update_simulation(float dt, u32 kDown, u32 kHeld, const circlePositi
 }
 
 static void render_scene_for_eye(float iod) {
-    C3D_Mtx proj, modelView;
-    Mtx_PerspStereoTilt(&proj, C3D_AngleFromDegrees(55.0f), C3D_AspectRatioTop, 0.25f, 260.0f, iod, 3.0f, false);
+    C3D_Mtx proj, view, modelView;
+    Mtx_PerspStereoTilt(&proj, C3D_AngleFromDegrees(55.0f), C3D_AspectRatioTop, 0.25f, 450.0f, iod, 3.0f, false);
 
-    float cam_dist = 5.8f;
+    float cam_dist = 3.2f;
     float eye_x = g_player.pos[0] + sinf(g_player.cam_yaw) * cosf(g_player.cam_pitch) * cam_dist;
     float eye_y = g_player.pos[1] + 1.75f + sinf(g_player.cam_pitch) * cam_dist;
     float eye_z = g_player.pos[2] + cosf(g_player.cam_yaw) * cosf(g_player.cam_pitch) * cam_dist;
@@ -1231,10 +1248,9 @@ static void render_scene_for_eye(float iod) {
     C3D_FVec camPos = FVec3_New(eye_x, eye_y, eye_z);
     C3D_FVec camTgt = FVec3_New(look_x, look_y, look_z);
     C3D_FVec camUp  = FVec3_New(0.0f, 1.0f, 0.0f);
-    Mtx_LookAt(&modelView, camPos, camTgt, camUp, false);
+    Mtx_LookAt(&view, camPos, camTgt, camUp, false);
 
     C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, g_uLoc_proj, &proj);
-    C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, g_uLoc_modelView, &modelView);
     C3D_FVUnifSet(GPU_VERTEX_SHADER, g_uLoc_lightDir, 0.35f, 0.82f, 0.45f, 1.0f);
 
     /* Configure TEV stage 0: Texture0 * VertexFragmentColor */
@@ -1243,15 +1259,43 @@ static void render_scene_for_eye(float iod) {
     C3D_TexEnvSrc(env, C3D_Both, GPU_TEXTURE0, GPU_PRIMARY_COLOR, 0);
     C3D_TexEnvFunc(env, C3D_Both, GPU_MODULATE);
 
-    /* 1. Draw Level Submeshes from g_level_vbo / g_level_ibo */
+    /* 1. Draw Level, Skinned Player & Skinned Actor NIF Submeshes from g_level_vbo / g_level_ibo */
     if (g_level_vbo && g_level_ibo && g_hdr.num_submeshes > 0) {
-        C3D_BufInfo* bufInfo = C3D_GetBufInfo();
-        BufInfo_Init(bufInfo);
-        BufInfo_Add(bufInfo, g_level_vbo, sizeof(Bw3dVertex), 4, 0x3210);
+        uint32_t last_base_vert = 0xFFFFFFFFu;
+        bool BlinkPlayer = (g_player.iframe_timer > 0.0f) && (((int)(g_time_sec * 16.0f)) & 1);
 
         for (uint32_t i = 0; i < g_hdr.num_submeshes; ++i) {
             const Bw3dSubmesh* sm = &g_submeshes[i];
             if (sm->index_count == 0) continue;
+
+            if (sm->flags & SUBMESH_PLAYER_MODEL) {
+                if (BlinkPlayer) continue;
+                C3D_Mtx local;
+                Mtx_Identity(&local);
+                Mtx_Translate(&local, g_player.pos[0], g_player.pos[1], g_player.pos[2], true);
+                Mtx_RotateY(&local, g_player.yaw - g_hdr.spawn_yaw, true);
+                Mtx_Multiply(&modelView, &view, &local);
+                C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, g_uLoc_modelView, &modelView);
+            } else if (sm->flags & SUBMESH_DYNAMIC) {
+                if (sm->actor_id >= g_hdr.num_actors) continue;
+                const LiveActor* act = &g_actors[sm->actor_id];
+                if (act->ai_state == 5) continue;
+                C3D_Mtx local;
+                Mtx_Identity(&local);
+                Mtx_Translate(&local, act->base.pos[0], act->base.pos[1], act->base.pos[2], true);
+                Mtx_RotateY(&local, act->base.yaw, true);
+                Mtx_Multiply(&modelView, &view, &local);
+                C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, g_uLoc_modelView, &modelView);
+            } else {
+                C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, g_uLoc_modelView, &view);
+            }
+
+            if (sm->base_vertex != last_base_vert) {
+                C3D_BufInfo* bufInfo = C3D_GetBufInfo();
+                BufInfo_Init(bufInfo);
+                BufInfo_Add(bufInfo, g_level_vbo + sm->base_vertex, sizeof(Bw3dVertex), 4, 0x3210);
+                last_base_vert = sm->base_vertex;
+            }
 
             if (sm->tex_id >= 0 && (uint32_t)sm->tex_id < g_hdr.num_textures && g_tex_valid && g_tex_valid[sm->tex_id]) {
                 C3D_TexBind(0, &g_textures[sm->tex_id]);
@@ -1263,6 +1307,15 @@ static void render_scene_for_eye(float iod) {
                 /* Thinned Toon Ghost Shimmer (cyan-green pulse so player sees paintable silhouettes!) */
                 float pulse = 0.45f + 0.25f * sinf(g_time_sec * 5.0f);
                 C3D_FVUnifSet(GPU_VERTEX_SHADER, g_uLoc_materialTint, 0.25f, pulse + 0.25f, 0.95f, 0.50f);
+            } else if ((sm->flags & SUBMESH_DYNAMIC) && sm->actor_id < g_hdr.num_actors) {
+                const LiveActor* act = &g_actors[sm->actor_id];
+                if (act->base.team == TEAM_FRIENDLY) {
+                    C3D_FVUnifSet(GPU_VERTEX_SHADER, g_uLoc_materialTint, 0.45f, 0.95f, 1.0f, 1.0f);
+                } else if (act->stun_timer > 0.0f) {
+                    C3D_FVUnifSet(GPU_VERTEX_SHADER, g_uLoc_materialTint, 1.0f, 0.95f, 0.35f, 1.0f);
+                } else {
+                    C3D_FVUnifSet(GPU_VERTEX_SHADER, g_uLoc_materialTint, 1.0f, 1.0f, 1.0f, 1.0f);
+                }
             } else {
                 C3D_FVUnifSet(GPU_VERTEX_SHADER, g_uLoc_materialTint, 1.0f, 1.0f, 1.0f, 1.0f);
             }
@@ -1271,8 +1324,9 @@ static void render_scene_for_eye(float iod) {
         }
     }
 
-    /* 2. Draw Dynamic Gameplay Objects (Mickey, Paintbrush, Blast Cone, Enemies, Bosses, Reticle) */
+    /* 2. Draw Dynamic Gameplay Overlays (Blast Cone, Projectiles, Particles, Reticle, and any fallback actors) */
     if (g_dyn_vbo_count > 0) {
+        C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, g_uLoc_modelView, &view);
         C3D_TexBind(0, &g_whiteTex);
         C3D_FVUnifSet(GPU_VERTEX_SHADER, g_uLoc_materialTint, 1.0f, 1.0f, 1.0f, 1.0f);
         C3D_BufInfo* bufInfo = C3D_GetBufInfo();
@@ -1312,9 +1366,17 @@ static void emit_dyn_box(float cx, float cy, float cz, float hx, float hy, float
 static void build_dynamic_frame_vbo(void) {
     g_dyn_vbo_count = 0;
 
-    /* 1. Mickey Character Model */
+    bool has_skinned_player = false;
+    for (uint32_t i = 0; i < g_hdr.num_submeshes; ++i) {
+        if (g_submeshes[i].flags & SUBMESH_PLAYER_MODEL) {
+            has_skinned_player = true;
+            break;
+        }
+    }
+
+    /* 1. Fallback Mickey Model ONLY if no exported Mickey NIF mesh is present */
     bool blink = (g_player.iframe_timer > 0.0f) && (((int)(g_time_sec * 16.0f)) & 1);
-    if (!blink) {
+    if (!has_skinned_player && !blink) {
         float px = g_player.pos[0], py = g_player.pos[1], pz = g_player.pos[2];
         float s = sinf(g_player.yaw), c = cosf(g_player.yaw);
         /* Shoes (yellow) */
@@ -1347,10 +1409,18 @@ static void build_dynamic_frame_vbo(void) {
         emit_dyn_box(g_player.pos[0], g_player.pos[1] + 0.35f, g_player.pos[2], r, 0.15f, r, br, bg, bb, 170);
     }
 
-    /* 2. Actors, Enemies, Bosses, NPCs, Pickups */
+    /* 2. Actors, Enemies, Bosses, NPCs, Pickups (skip procedural box if exported NIF submesh exists) */
     for (uint32_t i = 0; i < g_hdr.num_actors; ++i) {
         const LiveActor* a = &g_actors[i];
         if (a->ai_state == 5 || a->base.kind == ACTOR_TRIGGER_VOL || a->base.kind == ACTOR_TRIGGER_DMG) continue;
+        bool has_actor_mesh = false;
+        for (uint32_t sm_i = 0; sm_i < g_hdr.num_submeshes; ++sm_i) {
+            if ((g_submeshes[sm_i].flags & SUBMESH_DYNAMIC) && g_submeshes[sm_i].actor_id == i) {
+                has_actor_mesh = true;
+                break;
+            }
+        }
+        if (has_actor_mesh) continue;
         float ax = a->base.pos[0], ay = a->base.pos[1], az = a->base.pos[2];
 
         if (a->base.kind == ACTOR_PICKUP) {
@@ -1508,7 +1578,7 @@ int main(int argc, char** argv) {
     romfsInit();
     consoleInit(GFX_BOTTOM, NULL);
 
-    C3D_Init(C3D_DEFAULT_CMDBUF_SIZE);
+    C3D_Init(C3D_DEFAULT_CMDBUF_SIZE * 4);
 
     g_targetLeft  = C3D_RenderTargetCreate(240, 400, GPU_RB_RGBA8, GPU_RB_DEPTH24_STENCIL8);
     g_targetRight = C3D_RenderTargetCreate(240, 400, GPU_RB_RGBA8, GPU_RB_DEPTH24_STENCIL8);
