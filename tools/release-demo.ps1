@@ -18,7 +18,7 @@ if ((rustc -vV) -notcontains 'host: x86_64-pc-windows-msvc') {
 if (!$env:BLOTWORX_SIGNING_PASSWORD) { throw 'Set BLOTWORX_SIGNING_PASSWORD before building.' }
 if ($Publish -and !$ReleaseNotes) { throw 'Provide a release notes file when publishing.' }
 if ($Publish -and !$env:GH_TOKEN) { throw 'Set GH_TOKEN for the publishing step.' }
-$notes = if ($Publish) { Get-Content -LiteralPath $ReleaseNotes -Raw }
+$notes = if ($Publish) { [string](Get-Content -LiteralPath $ReleaseNotes -Raw) }
 $Sdk = (Resolve-Path -LiteralPath $Sdk).Path
 $ndk = Join-Path $Sdk 'ndk/27.3.13750724/toolchains/llvm/prebuilt/windows-x86_64/bin'
 $android = @{
