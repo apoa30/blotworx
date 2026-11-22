@@ -6,6 +6,7 @@ param(
     [Parameter(Mandatory)][string] $CodecLicense,
     [Parameter(Mandatory)][string] $Keystore,
     [Parameter(Mandatory)][ValidateRange(1, 2100000000)][int] $AndroidVersionCode,
+    [string] $DkpRoot = "C:\Users\Ryan\AppData\Local\Blotworx Publisher\3ds-sdk\opt\devkitpro",
     [string] $ReleaseNotes,
     [switch] $Publish
 )
@@ -53,6 +54,12 @@ try {
     cargo rustc --locked --jobs 2 --config 'profile.dev.package.ruffle_core.opt-level=0' --lib --target aarch64-linux-android -- '-Clink-arg=-Wl,-z,max-page-size=16384'
     if ($LASTEXITCODE -ne 0) { throw 'Android build failed.' }
     & "$root/android/package-apk.ps1" @android
+    & "$root/3ds/package-3ds.ps1" -DkpRoot $DkpRoot -OutputDirectory $output
+    $n3dsx = Join-Path $output "Blotworx-$version-3DS.3dsx"
+    $ncia  = Join-Path $output "Blotworx-$version-3DS.cia"
+    Get-FileHash -Algorithm SHA256 -LiteralPath $n3dsx,$ncia | ForEach-Object {
+        '{0}  {1}' -f $_.Hash.ToLowerInvariant(), (Split-Path $_.Path -Leaf)
+    } | Add-Content (Join-Path $output 'SHA256SUMS.txt') -Encoding ascii
 } finally {
     Pop-Location
 }
@@ -68,7 +75,8 @@ if ((git -C $root rev-parse HEAD) -ne $commit -or (git -C $root status --porcela
     throw 'Source changed during the build.'
 }
 $names = @("Blotworx-$version-Windows-x64.zip", 'Blotworx-Windows-x64.exe',
-    'SHA256SUMS.txt', $apkName, "$apkName.sha256")
+    'SHA256SUMS.txt', $apkName, "$apkName.sha256",
+    "Blotworx-$version-3DS.3dsx", "Blotworx-$version-3DS.cia")
 $artifacts = foreach ($name in $names) { Get-Item -LiteralPath (Join-Path $output $name) }
 
 $token = $env:GH_TOKEN

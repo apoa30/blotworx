@@ -72,6 +72,7 @@ mod gamebryo_camera;
 mod usable_selection;
 mod usable_prompt;
 mod disc_setup;
+pub mod export_3ds;
 mod updater;
 mod em2_player_tools;
 mod em2_children;
@@ -1309,6 +1310,32 @@ pub(crate) fn run_platform(
     #[cfg(target_os = "android")] android_app: Option<android_activity::AndroidApp>,
 ) -> Result<()> {
     if updater::finish_if_requested()? { return Ok(()); }
+    {
+        let mut args = std::env::args().skip(1);
+        if args.next().as_deref() == Some("export-3ds") {
+            let mut data_root: Option<PathBuf> = None;
+            let mut output_dir: Option<PathBuf> = None;
+            let mut levels: Vec<String> = Vec::new();
+            while let Some(arg) = args.next() {
+                match arg.as_str() {
+                    "--data" => data_root = Some(PathBuf::from(args.next().context("--data requires a directory")?)),
+                    "--output" => output_dir = Some(PathBuf::from(args.next().context("--output requires a directory")?)),
+                    "--level" => levels.push(args.next().context("--level requires a level path")?),
+                    "--help" | "-h" => {
+                        println!("Usage: blotworx export-3ds --data <DATA_DIR> --output <SD_BLOTWORX_DIR> [--level <Levels/Name.level>]");
+                        return Ok(());
+                    }
+                    other => anyhow::bail!("Unknown export-3ds option {other}"),
+                }
+            }
+            let data = data_root
+                .or_else(default_root)
+                .context("Specify --data <extracted DATA folder> for 3DS bundle export")?;
+            let out = output_dir.context("Specify --output <output folder> for 3DS bundle export")?;
+            export_3ds::export_bundle_cli(&data, &out, &levels)?;
+            return Ok(());
+        }
+    }
     #[cfg(debug_assertions)]
     {
         let mut args = std::env::args_os().skip(1);
@@ -3122,6 +3149,15 @@ impl Engine {
                         if self.actor_focus.is_some() && ui.button("Follow Mickey").clicked() {self.actor_focus=None;}
                         if ui.button("Place anvil root").on_hover_text("Prototype: original animated model and physics. Impact callbacks, inventory, child effects and lifetime remain incomplete. Shortcut: 2.").clicked() {
                             self.anvil_root_pending=true;
+                        }
+                        #[cfg(not(target_os = "android"))]
+                        if ui.button("Export 3DS Bundle").on_hover_text("Repackages the current level into a 3DS-optimized .bw3d bundle for Old 3DS / New 3DS (sdmc:/blotworx/levels/).").clicked() {
+                            if let Some(dir) = rfd::FileDialog::new().set_title("Choose 3DS Bundle Output Folder (sdmc:/blotworx)").pick_folder() {
+                                let out = dir.join("levels").join(export_3ds::level_bundle_filename(&world.report.level));
+                                if let Err(error) = export_3ds::export_world_to_bw3d(world, &out) {
+                                    self.error = Some(format!("3DS Export: {error:#}"));
+                                }
+                            }
                         }
                         if let Some(playback)=&world.actor_playback {
                             ui.label(format!("{}: {} {:.3}s â€” manual playback",world.entities[playback.entity].name,playback.name,playback.time));
