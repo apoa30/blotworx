@@ -3202,7 +3202,7 @@ pub struct Player {
     /// Motion output before collision clipping, used by animation inputs.
     pub animation_velocity: V,
     pub speed_overrides: super::motion_overrides::Overrides,
-    jump_stage: Option<(f32, usize)>,
+    pub(super) jump_stage: Option<(f32, usize)>,
     active_jump_height: f32,
     double_jump_available: bool,
     ground_jump_available: bool,
