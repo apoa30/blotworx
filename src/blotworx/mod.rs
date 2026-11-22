@@ -1329,7 +1329,7 @@ pub(crate) fn run_platform(
                 }
             }
             let data = data_root
-                .or_else(default_root)
+                .or_else(assets::default_root)
                 .context("Specify --data <extracted DATA folder> for 3DS bundle export")?;
             let out = output_dir.context("Specify --output <output folder> for 3DS bundle export")?;
             export_3ds::export_bundle_cli(&data, &out, &levels)?;

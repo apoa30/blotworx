@@ -205,10 +205,12 @@ pub fn export_world_to_bw3d(world: &World, output_path: &Path) -> Result<()> {
             }) || lower.contains("toon");
             if is_paintable {
                 flags |= SUBMESH_PAINTABLE;
-                let painted = world
-                    .whole_model_paint
-                    .get(&ent_idx)
-                    .map(|s| s.painted)
+                let painted = ent
+                    .components
+                    .iter()
+                    .find(|c| c.class_name == "WholeModelPaintComponent")
+                    .and_then(|c| c.properties.iter().find(|p| p.name == "IsPainted"))
+                    .and_then(|p| p.value.as_bool())
                     .unwrap_or(true);
                 if !painted {
                     flags &= !SUBMESH_PAINTED;
@@ -293,15 +295,15 @@ pub fn export_world_to_bw3d(world: &World, output_path: &Path) -> Result<()> {
                 -1
             }
         } else if let Some(first_img) = draw.material_images.first() {
-            let key = std::sync::Arc::as_ptr(&first_img.image.rgba) as usize;
+            let key = std::sync::Arc::as_ptr(&first_img.rgba) as usize;
             if let Some(&existing) = tex_map.get(&key) {
                 existing
             } else if textures.len() < MAX_3DS_TEXTURES {
                 let id = textures.len() as i16;
                 textures.push(swizzle_rgba_to_pica_64x64(
-                    &first_img.image.rgba,
-                    first_img.image.width,
-                    first_img.image.height,
+                    &first_img.rgba,
+                    first_img.width,
+                    first_img.height,
                 ));
                 tex_map.insert(key, id);
                 id
