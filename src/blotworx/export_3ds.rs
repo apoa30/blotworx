@@ -220,11 +220,12 @@ pub fn export_world_to_bw3d(world: &World, output_path: &Path) -> Result<()> {
                 flags |= SUBMESH_HAZARD;
             }
         }
-        let center = [
+        let local_center = [
             (draw.aabb_min[0] + draw.aabb_max[0]) * 0.5,
             (draw.aabb_min[1] + draw.aabb_max[1]) * 0.5,
             (draw.aabb_min[2] + draw.aabb_max[2]) * 0.5,
         ];
+        let center = transform_point(&draw.trans_mat, local_center);
         let dx = center[0] - spawn[0];
         let dy = center[1] - spawn[1];
         let dz = center[2] - spawn[2];
@@ -596,6 +597,8 @@ pub fn export_bundle_cli(data_root: &Path, output_dir: &Path, levels: &[String])
         let mut world = super::assets::load(data_root, level, &ctx)
             .with_context(|| format!("Failed to load {level} for 3DS export"))?;
         let _ = world.enable_demo_story();
+        let _ = world.prepare_gameplay_scene_requests();
+        let _ = world.advance_models(0.);
         let out_file = levels_dir.join(level_bundle_filename(level));
         export_world_to_bw3d(&world, &out_file)?;
         println!(

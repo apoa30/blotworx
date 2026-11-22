@@ -20,6 +20,10 @@
 #define MAX_PROJECTILES 32
 #define MAX_PARTICLES   96
 
+/* Cap heap and linear allocations to 24 MB each so Old 3DS (64 MB app region / 128 MB total) has 16+ MB free headroom */
+u32 __ctru_heap_size        = 24 * 1024 * 1024;
+u32 __ctru_linear_heap_size = 24 * 1024 * 1024;
+
 typedef struct {
     Bw3dActor base;
     float     spawn_pos[3];
@@ -443,13 +447,11 @@ static bool load_bw3d_level(const char* path) {
         Bw3dTexture* tmp = (Bw3dTexture*)malloc(sizeof(Bw3dTexture));
         for (uint32_t i = 0; i < g_hdr.num_textures; ++i) {
             if (fread(tmp, sizeof(Bw3dTexture), 1, f) == 1) {
-                bool ok = C3D_TexInitVRAM(&g_textures[i], 64, 64, GPU_RGBA5551);
-                if (!ok) ok = C3D_TexInit(&g_textures[i], 64, 64, GPU_RGBA5551);
-                if (ok) {
+                if (C3D_TexInit(&g_textures[i], 64, 64, GPU_RGBA5551)) {
                     C3D_TexSetFilter(&g_textures[i], GPU_LINEAR, GPU_LINEAR);
                     C3D_TexSetWrap(&g_textures[i], GPU_REPEAT, GPU_REPEAT);
-                    GSPGPU_FlushDataCache(tmp->pixels, sizeof(tmp->pixels));
-                    C3D_TexUpload(&g_textures[i], tmp->pixels);
+                    memcpy(g_textures[i].data, tmp->pixels, sizeof(tmp->pixels));
+                    GSPGPU_FlushDataCache(g_textures[i].data, sizeof(tmp->pixels));
                     g_tex_valid[i] = 1;
                 }
             }
@@ -491,7 +493,7 @@ static bool load_bw3d_level(const char* path) {
     fclose(f);
     reset_player_to_spawn();
     char msg[64];
-    snprintf(msg, sizeof(msg), "Loaded %s", g_hdr.title);
+    snprintf(msg, sizeof(msg), "Loaded %.48s", g_hdr.title);
     set_status(msg, 3.5f);
     return true;
 }
@@ -1214,20 +1216,22 @@ static void update_simulation(float dt, u32 kDown, u32 kHeld, const circlePositi
 }
 
 static void render_scene_for_eye(float iod) {
-    C3D_Mtx proj, view, modelView;
+    C3D_Mtx proj, modelView;
     Mtx_PerspStereoTilt(&proj, C3D_AngleFromDegrees(55.0f), C3D_AspectRatioTop, 0.25f, 260.0f, iod, 3.0f, false);
 
-    float cam_dist = 6.2f;
+    float cam_dist = 5.8f;
     float eye_x = g_player.pos[0] + sinf(g_player.cam_yaw) * cosf(g_player.cam_pitch) * cam_dist;
-    float eye_y = g_player.pos[1] + 1.5f + sinf(g_player.cam_pitch) * cam_dist;
+    float eye_y = g_player.pos[1] + 1.75f + sinf(g_player.cam_pitch) * cam_dist;
     float eye_z = g_player.pos[2] + cosf(g_player.cam_yaw) * cosf(g_player.cam_pitch) * cam_dist;
 
+    float look_x = g_player.pos[0] - sinf(g_player.cam_yaw) * 3.5f;
+    float look_y = g_player.pos[1] + 1.10f;
+    float look_z = g_player.pos[2] - cosf(g_player.cam_yaw) * 3.5f;
+
     C3D_FVec camPos = FVec3_New(eye_x, eye_y, eye_z);
-    C3D_FVec camTgt = FVec3_New(g_player.pos[0], g_player.pos[1] + 1.0f, g_player.pos[2]);
+    C3D_FVec camTgt = FVec3_New(look_x, look_y, look_z);
     C3D_FVec camUp  = FVec3_New(0.0f, 1.0f, 0.0f);
-    Mtx_LookAt(&view, camPos, camTgt, camUp, false);
-    Mtx_Identity(&modelView);
-    Mtx_Multiply(&modelView, &view, &modelView);
+    Mtx_LookAt(&modelView, camPos, camTgt, camUp, false);
 
     C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, g_uLoc_proj, &proj);
     C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, g_uLoc_modelView, &modelView);
@@ -1415,14 +1419,14 @@ static void build_dynamic_frame_vbo(void) {
 }
 
 static void draw_bottom_hud(void) {
-    printf("\x1b[1;1H\x1b[36;1m=== BLOTWORX ENGINE 3DS v0.1.0-demo.8 ===\x1b[0m");
-    printf("\x1b[2;1HLevel: \x1b[33m%-32.32s\x1b[0m", g_hdr.title);
+    printf("\x1b[1;1H\x1b[36;1m== BLOTWORX ENGINE 3DS v0.1.0-demo.8 ==\x1b[0m");
+    printf("\x1b[2;1HLvl: \x1b[33m%-34.34s\x1b[0m", g_hdr.title);
 
     /* Health, Paint, Thinner, E-Tickets */
     char hp_bar[16] = {0};
     for (int i = 0; i < g_player.max_hp && i < 10; ++i) hp_bar[i] = (i < g_player.hp) ? '*' : '.';
-    printf("\x1b[4;1HHealth: \x1b[31;1m[%s]\x1b[0m  E-Tickets: \x1b[33;1m%03d\x1b[0m   ", hp_bar, g_player.etickets);
-    printf("\x1b[5;1H\x1b[34;1mPaint  : %5.1f%%\x1b[0m  \x1b[32;1mThinner: %5.1f%%\x1b[0m   ", g_player.paint, g_player.thinner);
+    printf("\x1b[4;1HHP: \x1b[31;1m[%s]\x1b[0m   E-Tickets: \x1b[33;1m%03d\x1b[0m       ", hp_bar, g_player.etickets);
+    printf("\x1b[5;1H\x1b[34;1mPaint: %5.1f%%\x1b[0m  \x1b[32;1mThinner: %5.1f%%\x1b[0m    ", g_player.paint, g_player.thinner);
 
     /* Count painted toon pieces & active hostiles/friendlies */
     int painted_toons = 0, total_toons = 0, hostiles = 0, allies = 0;
@@ -1441,12 +1445,12 @@ static void draw_bottom_hud(void) {
             if (g_actors[i].base.kind == ACTOR_BOSS) boss = &g_actors[i];
         }
     }
-    printf("\x1b[6;1HToons: %d/%d  Hostiles: %d  Allies: %d   ", painted_toons, total_toons, hostiles, allies);
+    printf("\x1b[6;1HToons:%d/%d  Enemies:%d  Allies:%d      ", painted_toons, total_toons, hostiles, allies);
     if (boss) {
-        printf("\x1b[7;1H\x1b[35;1mBOSS %-16.16s HP:%2d/%2d %s\x1b[0m",
-               boss->base.name, boss->base.hp, boss->base.max_hp, boss->armor_intact ? "[ARMORED]" : "[EXPOSED]");
+        printf("\x1b[7;1H\x1b[35;1mBOSS %-14.14s HP:%2d/%2d %s\x1b[0m",
+               boss->base.name, boss->base.hp, boss->base.max_hp, boss->armor_intact ? "[ARMOR]" : "[WEAK!]");
     } else {
-        printf("\x1b[7;1HPos:(%5.1f,%4.1f,%5.1f) %s        ",
+        printf("\x1b[7;1HPos:(%5.1f,%4.1f,%5.1f) %-8.8s    ",
                g_player.pos[0], g_player.pos[1], g_player.pos[2],
                g_player.ledge_grabbed ? "[LEDGE]" : (g_player.grounded ? "[GROUND]" : "[IN AIR]"));
     }
@@ -1454,45 +1458,45 @@ static void draw_bottom_hud(void) {
     /* Old3DS / New3DS Memory Budget Telemetry */
     u32 app_free = osGetMemRegionFree(MEMREGION_APPLICATION) / (1024 * 1024);
     u32 lin_free = linearSpaceFree() / (1024 * 1024);
-    printf("\x1b[8;1HRAM Free: App %3luMB | Linear %2luMB (128MB OK)", (unsigned long)app_free, (unsigned long)lin_free);
+    printf("\x1b[8;1HRAM Free: App %2luMB | Lin %2luMB (128M OK)", (unsigned long)app_free, (unsigned long)lin_free);
 
     if (g_show_level_menu) {
-        printf("\x1b[10;1H\x1b[33;1m--- SELECT LEVEL (D-Pad + A, SELECT close) ---\x1b[0m");
+        printf("\x1b[10;1H\x1b[33;1m-- SELECT LEVEL (DPad+A, SELECT exit) -\x1b[0m");
         int total = g_num_levels > 0 ? g_num_levels : 1;
         for (int i = 0; i < 8; ++i) {
             int idx = i;
             if (idx < total) {
                 const char* nm = (g_num_levels > 0) ? g_level_names[idx] : "GV_ZoneA_Start (Built-in)";
-                printf("\x1b[%d;1H %c %-36.36s", 11 + i, (idx == g_menu_cursor) ? '>' : ' ', nm);
+                printf("\x1b[%d;1H %c %-35.35s", 11 + i, (idx == g_menu_cursor) ? '>' : ' ', nm);
             } else {
-                printf("\x1b[%d;1H                                        ", 11 + i);
+                printf("\x1b[%d;1H                                       ", 11 + i);
             }
         }
     } else if (g_player.active_dialogue >= 0 && (uint32_t)g_player.active_dialogue < g_hdr.num_dialogues) {
         const Bw3dDialogue* dlg = &g_dialogues[g_player.active_dialogue];
-        printf("\x1b[10;1H\x1b[32;1m+--- %-30.30s ---+\x1b[0m", dlg->speaker);
-        printf("\x1b[11;1H| %-36.36s |", dlg->text);
+        printf("\x1b[10;1H\x1b[32;1m+-- %-29.29s --+\x1b[0m", dlg->speaker);
+        printf("\x1b[11;1H| %-35.35s |", dlg->text);
         size_t len = strlen(dlg->text);
-        printf("\x1b[12;1H| %-36.36s |", len > 36 ? dlg->text + 36 : "");
-        printf("\x1b[13;1H| %-36.36s |", len > 72 ? dlg->text + 72 : "");
-        printf("\x1b[14;1H\x1b[32;1m+--- [Press A to Continue] ------------+\x1b[0m");
-        printf("\x1b[15;1H                                        ");
-        printf("\x1b[16;1H                                        ");
-        printf("\x1b[17;1H                                        ");
-        printf("\x1b[18;1H                                        ");
+        printf("\x1b[12;1H| %-35.35s |", len > 35 ? dlg->text + 35 : "");
+        printf("\x1b[13;1H| %-35.35s |", len > 70 ? dlg->text + 70 : "");
+        printf("\x1b[14;1H\x1b[32;1m+-- [Press A to Continue] -----------+\x1b[0m");
+        printf("\x1b[15;1H                                       ");
+        printf("\x1b[16;1H                                       ");
+        printf("\x1b[17;1H                                       ");
+        printf("\x1b[18;1H                                       ");
     } else {
-        printf("\x1b[10;1H\x1b[36m[Touch Here to Aim Paint/Thinner Reticle]\x1b[0m");
-        printf("\x1b[11;1HCPad:Move  B:Jump/2x  Y:Spin  X:Blast/InkJmp");
-        printf("\x1b[12;1HR:Paint    L:Thinner  A:Talk  DPad:Camera   ");
-        printf("\x1b[13;1HSELECT:Level Menu     START:Exit to Launcher");
-        printf("\x1b[14;1HPC Bundle: blotworx.exe export-3ds          ");
-        printf("\x1b[15;1HSD Path  : sdmc:/blotworx/levels/*.bw3d     ");
-        printf("\x1b[16;1H                                            ");
-        printf("\x1b[17;1H                                            ");
-        printf("\x1b[18;1H                                            ");
+        printf("\x1b[10;1H\x1b[36m[Touch Screen: Aim Paint/Thinner]      \x1b[0m");
+        printf("\x1b[11;1HCPad:Move  B:Jump/2x  Y:Spin  X:Blast  ");
+        printf("\x1b[12;1HR:Paint    L:Thinner  A:Talk  DPad:Cam ");
+        printf("\x1b[13;1HSELECT:Level Menu     START:Exit       ");
+        printf("\x1b[14;1HPC Export: blotworx.exe export-3ds     ");
+        printf("\x1b[15;1HSD Path  : sdmc:/blotworx/levels/*.bw3d");
+        printf("\x1b[16;1H                                       ");
+        printf("\x1b[17;1H                                       ");
+        printf("\x1b[18;1H                                       ");
     }
 
-    printf("\x1b[20;1H\x1b[33mStatus: %-32.32s\x1b[0m", g_status_timer > 0.0f ? g_status_msg : "Ready");
+    printf("\x1b[20;1H\x1b[33m%-39.39s\x1b[0m", g_status_timer > 0.0f ? g_status_msg : "Status: Ready");
     printf("\x1b[27;1H\x1b[44;37;1m[P-BLAST]\x1b[42;30;1m[T-BLAST]\x1b[43;30;1m[RESPAWN]\x1b[45;37;1m[ LEVELS ]\x1b[0m");
 }
 
@@ -1516,6 +1520,9 @@ int main(int argc, char** argv) {
     shaderProgramInit(&g_program);
     shaderProgramSetVsh(&g_program, &g_dvlb->DVLE[0]);
     C3D_BindProgram(&g_program);
+    C3D_DepthTest(true, GPU_GEQUAL, GPU_WRITE_ALL);
+    C3D_CullFace(GPU_CULL_NONE);
+    C3D_AlphaBlend(GPU_BLEND_ADD, GPU_BLEND_ADD, GPU_SRC_ALPHA, GPU_ONE_MINUS_SRC_ALPHA, GPU_SRC_ALPHA, GPU_ONE_MINUS_SRC_ALPHA);
 
     g_uLoc_proj         = shaderInstanceGetUniformLocation(g_program.vertexShader, "projection");
     g_uLoc_modelView    = shaderInstanceGetUniformLocation(g_program.vertexShader, "modelView");
