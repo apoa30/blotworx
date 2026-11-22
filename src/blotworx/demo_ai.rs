@@ -906,7 +906,7 @@ impl World {
                 } else {
                     team
                 };
-                return Ok(mlua::MultiValue::from_vec(vec![mlua::Value::Integer(team)]));
+                return Ok(mlua::MultiValue::from_vec(vec![mlua::Value::Integer(team as mlua::Integer)]));
             }
             _ => {}
         }

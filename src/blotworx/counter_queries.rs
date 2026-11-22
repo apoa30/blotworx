@@ -40,7 +40,7 @@ impl super::assets::World {
             } else {None}
         } else {None};
         if api=="PaintThinnerCounter_GetStatus" {
-            Ok(MultiValue::from_vec(counter.map(|c|Value::Integer(c.status() as i64)).into_iter().collect()))
+            Ok(MultiValue::from_vec(counter.map(|c|Value::Integer(c.status() as mlua::Integer)).into_iter().collect()))
         } else {
             Ok(MultiValue::from_vec(vec![Value::Number(counter.map_or(0.,|c|c.painted_percentage()) as f64)]))
         }

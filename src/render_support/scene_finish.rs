@@ -1,5 +1,5 @@
 //! Optional scene-only finishing. Runs before the HUD; Classic bypasses it.
-use egui_glow::glow::{self, HasContext};
+use glow::{self, HasContext};
 #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct Settings {

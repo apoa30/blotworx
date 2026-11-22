@@ -1,7 +1,7 @@
 //! Nonblocking scene GPU intervals. These measure elapsed GPU timeline time
 //! between commands, including queue/CPU gaps, rather than GPU busy occupancy.
 use super::viewport3d::RenderWork;
-use egui_glow::glow::{self, HasContext};
+use glow::{self, HasContext};
 use std::sync::{Arc, Mutex};
 struct Slot {
     query: glow::Query,

@@ -2,7 +2,7 @@
 //! The initial snapshot belongs to the render owner, not an effect pass:
 //! omitted assignments inherit device state rather than invented defaults.
 use anyhow::{ensure, Context, Result};
-use eframe::glow::{self, HasContext};
+use glow::{self, HasContext};
 use std::collections::BTreeMap;
 use super::d3d9_state::{AlphaTest, State};
 

@@ -160,7 +160,7 @@ pub(super) fn report_button(
                 } else {
                     ui.label("Loading is taking longer than usual.");
                 }
-                #[cfg(not(target_os = "android"))]
+                #[cfg(not(any(target_os = "android", target_os = "horizon")))]
                 if ui.button("Save diagnostic report…").clicked() {
                     let report = crate::startup_log::report(level, error, elapsed);
                     if let Err(error) = crate::startup_log::save_report(&report) {

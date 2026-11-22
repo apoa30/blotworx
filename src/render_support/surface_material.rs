@@ -86,7 +86,7 @@ impl Plan {
 /// Older additive FX encode perceived emission in alpha. Convert that energy
 /// with RGB when entering the linear scene; coverage alpha stays linear.
 pub fn encoded_emission(blend: Option<(u32, u32, u32)>) -> bool {
-    use egui_glow::glow;
+    use glow;
     blend == Some((glow::SRC_ALPHA, glow::ONE, glow::FUNC_ADD))
 }
 #[cfg(test)]
@@ -94,7 +94,7 @@ mod tests {
     use super::*;
     #[test]
     fn additive_energy_preserves_authored_fade_without_changing_coverage() {
-        use egui_glow::glow;
+        use glow;
         assert!(encoded_emission(Some((
             glow::SRC_ALPHA,
             glow::ONE,

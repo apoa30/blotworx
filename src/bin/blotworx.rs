@@ -61,6 +61,7 @@ fn main() -> anyhow::Result<()> {
     if validation.as_deref() == Some("--validate-dbc-courtyard-armor") {
         return blotworx::blotworx::validate_dbc_courtyard_armor();
     }
+    #[cfg(not(target_os = "horizon"))]
     if first_arg.as_deref() == Some(std::ffi::OsStr::new("diagnose")) || startup_log::install().is_none() {
         let _ = env_logger::try_init();
     }
@@ -108,7 +109,7 @@ fn main() -> anyhow::Result<()> {
     if validation.as_deref() == Some("--validate-live-inventory") {
         return blotworx::blotworx::validate_live_inventory();
     }
-    #[cfg(debug_assertions)]
+    #[cfg(all(debug_assertions, not(target_os = "horizon")))]
     if validation.as_deref() == Some("--validate-material-gpu") {
         struct Validation;
         impl eframe::App for Validation {

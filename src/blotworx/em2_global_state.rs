@@ -59,10 +59,10 @@ impl State {
         }
         let key = String::from_lua(args.front().cloned().unwrap_or(Value::Nil), lua)?;
         let result = if name == "GetGlobal" {
-            self.get(&key).map(|v| Value::Integer(v as i64))
+            self.get(&key).map(|v| Value::Integer(v as mlua::Integer))
         } else {
             let value = i32::from_lua(args.get(1).cloned().unwrap_or(Value::Integer(0)), lua)?;
-            self.set(&key, value).map(|v| Value::Integer(v as i64))
+            self.set(&key, value).map(|v| Value::Integer(v as mlua::Integer))
         };
         Ok(mlua::MultiValue::from_vec(vec![
             result.unwrap_or(Value::Nil)

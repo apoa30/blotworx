@@ -1,5 +1,8 @@
 //! Blotworx Engine: native, read-only exploration of the original cooked level.
+#[cfg(not(target_os = "horizon"))]
 mod em2;
+#[cfg(target_os = "horizon")]
+pub(crate) mod horizon_3ds;
 mod em2_global_state;
 mod em2_quest_path;
 mod em2_music;
@@ -65,14 +68,17 @@ mod em2_camera_manager;
 mod em2_follow_camera;
 mod authored_motion;
 mod em2_cursor_camera;
+#[cfg(not(target_os = "horizon"))]
 mod em2_audio_player;
 mod animation_chunks;
 mod igc_timeline;
 mod gamebryo_camera;
 mod usable_selection;
 mod usable_prompt;
+#[cfg(not(target_os = "horizon"))]
 mod disc_setup;
 pub mod export_3ds;
+#[cfg(not(target_os = "horizon"))]
 mod updater;
 mod em2_player_tools;
 mod em2_children;
@@ -889,7 +895,10 @@ fn options() -> Result<Options> {
     let mut args = std::env::args().skip(1).peekable();
     let diagnostic = args.next_if(|arg| arg == "diagnose").is_some();
     if !diagnostic {
-        o.level = disc_setup::START_LEVEL.into();
+        #[cfg(not(target_os = "horizon"))]
+        { o.level = disc_setup::START_LEVEL.into(); }
+        #[cfg(target_os = "horizon")]
+        { o.level = "Levels/GV_ZoneA_Start.level".into(); }
         o.updates = true;
     }
     while let Some(a) = args.next() {
@@ -1306,6 +1315,12 @@ pub fn run() -> Result<()> {
     run_platform(#[cfg(target_os = "android")] None)
 }
 
+#[cfg(target_os = "horizon")]
+pub(crate) fn run_platform() -> Result<()> {
+    horizon_3ds::run()
+}
+
+#[cfg(not(target_os = "horizon"))]
 pub(crate) fn run_platform(
     #[cfg(target_os = "android")] android_app: Option<android_activity::AndroidApp>,
 ) -> Result<()> {
@@ -2479,6 +2494,7 @@ enum LevelLoad {
     NewCampaign,
 }
 
+#[cfg(not(target_os = "horizon"))]
 struct Engine {
     setup: disc_setup::Setup,
     updater: updater::Updater,
@@ -2588,6 +2604,7 @@ struct Engine {
     previous_buttons: u16,
     pad_edges: u16,
 }
+#[cfg(not(target_os = "horizon"))]
 impl Engine {
     fn new(cc: &eframe::CreationContext<'_>, o: Options) -> Self {
         cc.egui_ctx.set_visuals(egui::Visuals::dark());
@@ -4457,6 +4474,7 @@ impl Engine {
         }
     }
 }
+#[cfg(not(target_os = "horizon"))]
 impl Engine {
     fn draw_options(&mut self,ctx:&egui::Context) {
         let before=serde_json::to_vec(&self.preferences).unwrap_or_default();
@@ -4593,6 +4611,7 @@ impl Engine {
         }
     }
 }
+#[cfg(not(target_os = "horizon"))]
 impl eframe::App for Engine {
     fn on_exit(&mut self, _gl: Option<&egui_glow::painter::Context>) {
         #[cfg(feature = "blotworx-ui-render")]
@@ -5221,6 +5240,7 @@ impl eframe::App for Engine {
     }
 }
 
+#[cfg(not(target_os = "horizon"))]
 impl Engine {
     #[cfg(feature = "blotworx-ui-render")]
     fn present_title(&mut self, ui: &mut egui::Ui) {

@@ -19,6 +19,8 @@
 #include "vectors.hpp"
 #if defined(__aarch64__)
 #include "sse2neon.h"
+#elif defined(__arm__)
+#include "sse_scalar_arm.h"
 #else
 #include <smmintrin.h>
 #endif

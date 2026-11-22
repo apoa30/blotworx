@@ -25,11 +25,8 @@ required-features = ["blotworx-ui"]
 [dependencies]
 bytemuck = "1.25"
 libm = "0.2.16"
-eframe = { version = "0.36", default-features = false, features = ["glow", "default_fonts"] }
-egui = "0.36"
-egui_extras = { version = "0.36", features = ["all_loaders"] }
-egui_glow = "0.36"
-glow = "0.15"
+egui = { version = "0.36", default-features = false }
+glow = "0.17"
 ruffle_core = { path = "third_party/ruffle/core", default-features = false, optional = true }
 ruffle_render = { git = "https://github.com/ruffle-rs/ruffle", rev = "45366370ed7d1a59c89aa3cf7b765c7a274407cd", optional = true }
 swf = { git = "https://github.com/ruffle-rs/ruffle", rev = "45366370ed7d1a59c89aa3cf7b765c7a274407cd", optional = true }
@@ -46,24 +43,36 @@ roxmltree = "0.20"
 toml = "0.8"
 anyhow = "1"
 memchr = "2.8"
-ring = "0.17"
-ureq = "3.4"
 unluac = { version = "=1.4.3", default-features = false }
-mlua = { version = "0.11", features = ["lua51", "vendored", "send"] }
 zip = { version = "2", default-features = false, features = ["deflate"] }
 flate2 = "1"
 log = "0.4"
+semver = "1"
+image = { version = "0.25", default-features = false, features = ["dds", "png", "jpeg", "tga"] }
+wiiu_swizzle = { version = "0.3", features = ["std"] }
+
+[target.'cfg(not(target_os = "horizon"))'.dependencies]
+eframe = { version = "0.36", default-features = false, features = ["glow", "default_fonts"] }
+egui = "0.36"
+egui_extras = { version = "0.36", features = ["all_loaders"] }
+egui_glow = "0.36"
+ring = "0.17"
+ureq = "3.4"
+mlua = { version = "0.11", features = ["lua51", "vendored", "send"] }
 env_logger = "0.11"
 open = "5"
 dirs = "5"
 nod = "=1.4.4"
-semver = "1"
 tempfile = "3"
-image = { version = "0.25", default-features = false, features = ["dds", "png", "jpeg", "tga"] }
-wiiu_swizzle = { version = "0.3", features = ["std"] }
 
-[target.'cfg(not(target_os = "android"))'.dependencies]
+[target.'cfg(target_os = "horizon")'.dependencies]
+mlua = { version = "0.11", features = ["lua51", "send"] }
+
+[target.'cfg(not(any(target_os = "android", target_os = "horizon")))'.dependencies]
 rfd = "0.15"
+
+[patch.crates-io]
+mlua-sys = { path = "third_party/mlua-sys" }
 
 [target.'cfg(target_os = "android")'.dependencies]
 android-activity = { version = "0.6", features = ["native-activity"] }

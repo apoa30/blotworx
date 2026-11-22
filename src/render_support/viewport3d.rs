@@ -1,12 +1,12 @@
-// editors/viewport3d.rs — Centralized 3D Viewport, Camera, Shaders & Hardware GL Renderer
+// editors/viewport3d.rs â€” Centralized 3D Viewport, Camera, Shaders & Hardware GL Renderer
 
 use egui::{Color32, Rect, Response, Sense, Ui};
-use egui_glow::glow::{self, HasContext};
+use glow::{self, HasContext};
 use std::sync::{Arc, OnceLock};
 
-// ─────────────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // Shared Types & Data
-// ─────────────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[derive(Clone)]
 pub struct DecodedImage {
@@ -322,9 +322,9 @@ pub struct GpuLineSegment {
     pub color: [f32; 4],
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // Matrix & Vector Math
-// ─────────────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 pub fn perspective_matrix(fovy: f32, aspect: f32, near: f32, far: f32) -> [f32; 16] {
     let f = 1.0 / (fovy * 0.5).tan();
@@ -508,9 +508,9 @@ pub fn is_aabb_visible(mn: [f32; 3], mx: [f32; 3], vp_mat: &[f32; 16]) -> bool {
     true
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // Hardware GL Renderers & Texture Upload
-// ─────────────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 pub unsafe fn upload_gpu_texture(
     gl: &glow::Context,
@@ -1761,7 +1761,7 @@ impl GpuViewportCache {
         gl.active_texture(glow::TEXTURE0);
     }
     pub unsafe fn init(gl: &glow::Context) -> Option<Self> {
-        // ── Shadow Map Pass Shaders ──────────────────────────────────────────
+        // â”€â”€ Shadow Map Pass Shaders â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         let vs_shadow_src = r#"
             #version 330 core
             layout(location = 0) in vec3 a_pos;
@@ -1798,12 +1798,12 @@ impl GpuViewportCache {
         let u_shadow_light_vp = gl.get_uniform_location(shadow_program, "u_light_vp")?;
         let u_shadow_model = gl.get_uniform_location(shadow_program, "u_model")?;
 
-        // The 2048² legacy shadow target costs roughly 16 MiB of depth storage.
+        // The 2048Â² legacy shadow target costs roughly 16 MiB of depth storage.
         // Most game scenes use native Wii material programs and never sample it,
         // so allocate it only when a frame actually needs the legacy fallback.
         let (shadow_fbo, shadow_tex) = (None, None);
 
-        // ── Main Mesh Shaders ────────────────────────────────────────────────
+        // â”€â”€ Main Mesh Shaders â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         let vs_mesh_src = r#"
             #version 330 core
             layout(location = 0) in vec3 a_pos;
@@ -2402,9 +2402,9 @@ impl GpuViewportCache {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // Unified 3D Viewport Navigation & Hardware Render Execution
-// ─────────────────────────────────────────────────────────────────────────────
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 pub fn update_and_render_viewport(
     ui: &mut Ui,
@@ -2453,7 +2453,7 @@ pub(crate) fn render_viewport(
     let available = ui.available_size();
     let (rect, response) = ui.allocate_at_least(available, Sense::click_and_drag());
 
-    // ── Camera Vectors ────────────────────────────────────────────────────────
+    // â”€â”€ Camera Vectors â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     let cos_p = vp.pitch.cos();
     let sin_p = vp.pitch.sin();
     let cos_y = vp.yaw.cos();
@@ -2464,7 +2464,7 @@ pub(crate) fn render_viewport(
     let right = [sin_y, 0.0, -cos_y];
     let up = [-cos_y * sin_p, cos_p, -sin_y * sin_p];
 
-    // ── Mouse Navigation Controls ─────────────────────────────────────────────
+    // â”€â”€ Mouse Navigation Controls â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     if editor_navigation && (response.hovered() || response.dragged()) {
         // Orbit (Right-click or Left-click drag without Shift)
         if response.dragged_by(egui::PointerButton::Secondary)
@@ -2545,7 +2545,7 @@ pub(crate) fn render_viewport(
         }
     }
 
-    // ── Eye Position & Light Space Shadow Matrix ─────────────────────────────
+    // â”€â”€ Eye Position & Light Space Shadow Matrix â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     let eye = [
         vp.camera_target[0] + vp.distance * cos_y * cos_p,
         vp.camera_target[1] + vp.distance * sin_p,
@@ -2608,7 +2608,7 @@ pub(crate) fn render_viewport(
     let mut light_vp = mat4_mul(&l_proj, &l_view);
     if vp.surfaces.mode!=0 {for i in [12,13]{let pixel=light_vp[i]*1024.;light_vp[i]+=(pixel.round()-pixel)/1024.;}}
 
-    // ── Execute Hardware GL PaintCallback ─────────────────────────────────────
+    // â”€â”€ Execute Hardware GL PaintCallback â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     let pixel_probe=vp.pixel_probe;
     let native_material=vp.native_material.clone();
     let surfaces = vp.surfaces;
@@ -2628,6 +2628,8 @@ pub(crate) fn render_viewport(
     let render_mode = vp.render_mode;
     let lighting_mode = vp.lighting_mode;
 
+    #[cfg(not(target_os = "horizon"))]
+    {
     let callback = egui::PaintCallback {
         rect,
         callback: Arc::new(egui_glow::CallbackFn::new(move |info, painter| {
@@ -2913,7 +2915,7 @@ pub(crate) fn render_viewport(
                     gl.color_mask(true, true, true, true);
                     gl.clear_depth(1.0);
 
-                    // ── Pass 1: Render Cast Shadow Map to Framebuffer ────────
+                    // â”€â”€ Pass 1: Render Cast Shadow Map to Framebuffer â”€â”€â”€â”€â”€â”€â”€â”€
                     // The legacy shadow map only needs redrawing every other frame (the scene moves at
                     // 30 Hz); in between, sample it with the matrix it was drawn with.
                     cache.shadow_age = cache.shadow_age.wrapping_add(1);
@@ -3065,7 +3067,7 @@ pub(crate) fn render_viewport(
                     }
 
                     // Light group matching rules:
-                    //   Entity group "" or "(null)" → dynamic: receives all lights.
+                    //   Entity group "" or "(null)" â†’ dynamic: receives all lights.
                     //   Entity group is space-separated: "Global ToonLight" means both groups.
                     //   A light matches if any of its own groups intersects with any of the entity's groups.
                     let is_dynamic_group =
@@ -3524,6 +3526,7 @@ pub(crate) fn render_viewport(
         })),
     };
     ui.painter().add(egui::Shape::Callback(callback));
+    }
 
     if let Some((title, details)) = overlay_warning {
         let warning_rect = ui.painter().with_clip_rect(rect).text(

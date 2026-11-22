@@ -1,6 +1,6 @@
 //! Retained model-to-texture target. Solid120 gray becomes119 after I4
 //! expansion (7*17); white remains255. EFB/raster parity is not yet accepted.
-use egui_glow::glow::{self, HasContext};
+use glow::{self, HasContext};
 use std::sync::Arc;
 #[derive(Clone, Debug)]
 pub struct Caster {

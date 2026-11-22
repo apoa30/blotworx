@@ -1,7 +1,7 @@
 //! Lossless PC texture submission: authored BC blocks, mip levels and faces.
 //! The editor's decoded single-image preview is intentionally not this path.
 use anyhow::{ensure,Context,Result};
-use eframe::glow::{self,HasContext};
+use glow::{self,HasContext};
 use std::{ops::Range,sync::{Arc,Weak}};
 use crate::render_support::nif::pixel_data::{self,Encoding,Storage};
 use super::d3d9_sampling::ImageView;

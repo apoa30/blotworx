@@ -54,7 +54,7 @@ try {
     cargo rustc --locked --jobs 2 --config 'profile.dev.package.ruffle_core.opt-level=0' --lib --target aarch64-linux-android -- '-Clink-arg=-Wl,-z,max-page-size=16384'
     if ($LASTEXITCODE -ne 0) { throw 'Android build failed.' }
     & "$root/android/package-apk.ps1" @android
-    & "$root/3ds/package-3ds.ps1" -DkpRoot $DkpRoot -OutputDirectory $output
+    & "$root/3ds/package-3ds.ps1" -DkpRoot $DkpRoot -OutputDirectory $output -Release
     $n3dsx = Join-Path $output "Blotworx-$version-3DS.3dsx"
     $ncia  = Join-Path $output "Blotworx-$version-3DS.cia"
     Get-FileHash -Algorithm SHA256 -LiteralPath $n3dsx,$ncia | ForEach-Object {

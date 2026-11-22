@@ -391,6 +391,15 @@ impl Batch {
                 continue;
             }
             report.placed_entities += 1;
+            #[cfg(target_os = "horizon")]
+            if report.placed_entities % 100 == 1 {
+                super::super::horizon_3ds::debug_stage(&format!(
+                    "Import {} ent {} draws {}",
+                    path.rsplit('/').next().unwrap_or(&path),
+                    report.placed_entities,
+                    draws.len()
+                ));
+            }
             let draw_start = draws.len();
             let mut mesh_draws = HashMap::<u32, Vec<usize>>::new();
             let mut model_asset = None;
@@ -792,6 +801,7 @@ impl Batch {
                                 report.warnings.push(format!("Static collision {path} has entity scale {scales:?}; its serialized triangle radius is preserved, but retail runtime scaling of that radius remains unverified."));
                             }
                             let triangle_radius = mesh.triangle_radius;
+                            #[cfg(not(target_os = "horizon"))]
                             report.geometry.push(serde_json::json!({"entity":entity.name,"kind":"collision","min":lo,"max":hi,"matrix":matrix,"vertices":mesh.vertices.len(),"indices":mesh.indices.len(),"triangle_radius":triangle_radius}));
                             if mesh.convex {
                                 convex_parts.push((
@@ -1022,6 +1032,7 @@ impl Batch {
                     }
                     let indices = geometry_cache.indices(&geometry_key, &mesh.indices);
                     let mut images = vec![];
+                    #[cfg(not(target_os = "horizon"))]
                     let preview = material_preview::prepare(&mesh.material, &sources, has_baked)
                         .and_then(|program| {
                             images = material_preview::images(
@@ -1032,6 +1043,10 @@ impl Batch {
                             )?;
                             Ok(program)
                         });
+                    #[cfg(target_os = "horizon")]
+                    let preview: Result<Arc<material_preview::Program>, String> =
+                        Err(String::new());
+                    #[cfg(not(target_os = "horizon"))]
                     if let Err(e) = &preview {
                         report.warnings.push(e.clone())
                     }
@@ -1073,6 +1088,7 @@ impl Batch {
                     }
                     report.render_triangles += mesh.indices.len() / 3;
                     let (lo, hi) = transform_aabb(draw_bounds.0, draw_bounds.1, &matrix);
+                    #[cfg(not(target_os = "horizon"))]
                     report.geometry.push(
                         serde_json::json!({"entity":entity.name,"asset":path,"kind":"render","min":lo,"max":hi,
                             "nif_mesh_block":mesh.mesh_index,

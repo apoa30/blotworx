@@ -10,6 +10,7 @@ pub struct Catalog {
 const SOURCE_SHA256: &str = "ac25d520f329a3d0507d656f0ab1cf1c34025bb36ff866187ad082ae3e0a4ebf";
 impl Catalog {
     pub fn load(root: &Path) -> Result<Self> {
+        use std::io::{Read, Seek, SeekFrom};
         for entry in std::fs::read_dir(root)? {
             let entry = entry?;
             if entry.file_type()?.is_file()
@@ -18,9 +19,25 @@ impl Catalog {
                     .extension()
                     .is_some_and(|e| e.eq_ignore_ascii_case("rel"))
             {
-                let bytes = std::fs::read(entry.path())?;
-                if crate::mod_project::digest(&bytes) == SOURCE_SHA256 {
-                    return Self::from_verified_rel(&bytes);
+                let hash = crate::sha256_file(&entry.path())?;
+                let hex: String = hash.iter().map(|b| format!("{b:02x}")).collect();
+                if hex == SOURCE_SHA256 {
+                    // Read only the registration code window and string table window
+                    // instead of allocating the entire 13.6 MB REL into RAM.
+                    let mut file = std::fs::File::open(entry.path())?;
+                    let code_base: usize = 0x2ebb98;
+                    let code_len: usize = 0x2ee290 - code_base;
+                    let mut code = vec![0u8; code_len];
+                    file.seek(SeekFrom::Start(code_base as u64))?;
+                    file.read_exact(&mut code)?;
+
+                    let str_base: usize = (0x4c6bf4_i32 - 32768) as usize;
+                    let str_len: usize = 65536 + 512;
+                    let mut strings = vec![0u8; str_len];
+                    file.seek(SeekFrom::Start(str_base as u64))?;
+                    file.read_exact(&mut strings)?;
+
+                    return Self::from_verified_windows(code_base, &code, str_base, &strings);
                 }
             }
         }
@@ -31,10 +48,20 @@ impl Catalog {
             crate::mod_project::digest(bytes) == SOURCE_SHA256,
             "Unverified animation event registration code"
         );
+        Self::from_verified_windows(0, bytes, 0, bytes)
+    }
+    fn from_verified_windows(
+        code_base: usize,
+        code: &[u8],
+        str_base: usize,
+        strings: &[u8],
+    ) -> Result<Self> {
         let word = |at: usize| -> Result<u32> {
+            let rel = at
+                .checked_sub(code_base)
+                .context("Animation registration address precedes code window")?;
             Ok(u32::from_be_bytes(
-                bytes
-                    .get(at..at + 4)
+                code.get(rel..rel + 4)
                     .context("Truncated animation registration code")?
                     .try_into()
                     .unwrap(),
@@ -70,8 +97,11 @@ impl Catalog {
                     "Unexpected animation registration target"
                 );
                 let at = (0x4c6bf4_i32 + i32::from(name as i16)) as usize;
-                let tail = bytes
-                    .get(at..)
+                let str_rel = at
+                    .checked_sub(str_base)
+                    .context("Animation name pointer precedes string window")?;
+                let tail = strings
+                    .get(str_rel..)
                     .context("Animation name pointer exceeds module")?;
                 let end = tail
                     .iter()

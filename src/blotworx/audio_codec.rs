@@ -3,6 +3,12 @@
 use anyhow::{ensure, Context, Result};
 use std::{io::{Read, BufReader}, path::{Path, PathBuf}, process::{Child, ChildStdout, Stdio}};
 
+#[cfg(target_os = "horizon")]
+pub fn provision() -> Result<PathBuf> {
+    anyhow::bail!("External audio codec binary is unsupported on Nintendo 3DS")
+}
+
+#[cfg(not(target_os = "horizon"))]
 pub fn provision() -> Result<PathBuf> {
     static READY: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
     static INSTALL: std::sync::Mutex<()> = std::sync::Mutex::new(());

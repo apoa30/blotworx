@@ -7,8 +7,7 @@ pub(crate) mod havok_script;
 pub mod repository;
 
 pub fn content_hash(data: &[u8]) -> String {
-    ring::digest::digest(&ring::digest::SHA256, data)
-        .as_ref()
+    crate::sha256(data)
         .iter()
         .map(|v| format!("{v:02x}"))
         .collect()

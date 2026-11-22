@@ -1,7 +1,7 @@
 //! Depth-tested retail bicone mask adapter. Native TEV mask color120/255,
 //! additive front faces and subtractive back faces, then scene*(1-mask).
 //! Target precision/order and original-frame parity remain separate validation.
-use egui_glow::glow::{self, HasContext};
+use glow::{self, HasContext};
 use std::sync::Arc;
 #[derive(Clone, Debug)]
 pub struct Mesh {

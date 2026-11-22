@@ -129,7 +129,7 @@ struct reflectorStatic {
   static RegistryType PC_EXTERN &Registry();
 };
 
-static_assert(sizeof(reflectorStatic) == 56);
+static_assert(sizeof(reflectorStatic) == (sizeof(void *) == 8 ? 56 : 32));
 
 struct ReflectedInstance {
 private:

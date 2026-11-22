@@ -1,7 +1,7 @@
 //! Original PC effects at the shared viewport draw boundary. No scene defaults
 //! are invented here: the scene owner must admit numeric and device inputs.
 use anyhow::{ensure,Context,Result};
-use eframe::glow::{self,HasContext};
+use glow::{self,HasContext};
 use std::{collections::{BTreeMap,BTreeSet},sync::{Arc,Weak}};
 use crate::render_support::{native_material::{Backend,Frame},nif::MaterialBindings,viewport3d::{GpuDrawCommand,GpuMeshHandle}};
 use super::{d3d9_gpu as gpu,d3d9_images as images,d3d9_material::{Resources,Texture},d3d9_raster as raster,d3d9_sampling as sampling,d3d9_shader::{Effect,PassSamplers,TranslatedPass},d3d9_state,d3d9_vertices};

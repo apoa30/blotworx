@@ -10,10 +10,18 @@ const LOG_BYTES: u64 = 24 * 1024;
 fn directory() -> Option<PathBuf> {
     #[cfg(target_os = "android")]
     return crate::android_app::storage();
-    #[cfg(not(target_os = "android"))]
+    #[cfg(target_os = "horizon")]
+    return Some(PathBuf::from("sdmc:/blotworx"));
+    #[cfg(not(any(target_os = "android", target_os = "horizon")))]
     Some(dirs::data_local_dir()?.join("Blotworx Engine"))
 }
 
+#[cfg(target_os = "horizon")]
+pub fn install() -> Option<PathBuf> {
+    None
+}
+
+#[cfg(not(target_os = "horizon"))]
 pub fn install() -> Option<PathBuf> {
     let directory = directory()?;
     fs::create_dir_all(&directory).ok()?;
@@ -102,6 +110,7 @@ pub fn report(level: Option<&str>, error: Option<&str>, elapsed: Option<std::tim
             }
         }
     }
+    #[cfg(not(target_os = "horizon"))]
     if let Some(home) = dirs::home_dir() {
         for separator in ['\\', '/'] {
             let path = home.to_string_lossy().replace(['\\', '/'], &separator.to_string());
@@ -130,7 +139,7 @@ pub fn report(level: Option<&str>, error: Option<&str>, elapsed: Option<std::tim
     report
 }
 
-#[cfg(not(target_os = "android"))]
+#[cfg(not(any(target_os = "android", target_os = "horizon")))]
 pub fn save_report(report: &str) -> std::io::Result<bool> {
     let Some(path) = rfd::FileDialog::new()
         .set_file_name("blotworx-report.txt")

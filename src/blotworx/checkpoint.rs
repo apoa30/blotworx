@@ -100,8 +100,8 @@ impl State {
     }
     pub fn summary(&self) -> serde_json::Value {
         let snapshot=self.latest.as_ref().map(|snapshot| {
-            let digest=ring::digest::digest(&ring::digest::SHA256,&snapshot.bytes[..snapshot.logical_size]);
-            let hash=digest.as_ref().iter().map(|byte|format!("{byte:02x}")).collect::<String>();
+            let digest=crate::sha256(&snapshot.bytes[..snapshot.logical_size]);
+            let hash=digest.iter().map(|byte|format!("{byte:02x}")).collect::<String>();
             let archive=Archive::parse(&snapshot.bytes);
             match archive {
                 Ok(archive)=>serde_json::json!({"logical_bytes":snapshot.logical_size,"storage_bytes":snapshot.bytes.len(),

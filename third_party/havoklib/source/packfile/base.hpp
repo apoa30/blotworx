@@ -21,7 +21,7 @@
 #include "spike/io/binwritter.hpp"
 #include "spike/type/pointer.hpp"
 
-template <class C, template <class _C> class _ipointer> struct hkArray {
+template <class C, template <class ElemT> class _ipointer> struct hkArray {
   typedef C value_type;
 
   _ipointer<C> data;

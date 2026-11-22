@@ -2,7 +2,7 @@
 //! pp_bloom (PostProcess_BloomThresh / GaussBlurH / GaussBlurV / BloomComp) and
 //! pp_colourcorrection (PostProcess_ColorCorrection). The active render profile
 //! (RenderSceneEffectsComponent) supplies the values each frame via `set`.
-use egui_glow::glow::{self, HasContext};
+use glow::{self, HasContext};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Params {

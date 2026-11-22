@@ -1,6 +1,6 @@
 //! Half-resolution geometry contact visibility, with view-space radius and
 //! depth-aware reconstruction. Consumed by the indirect-light resolve only.
-use egui_glow::glow::{self, HasContext};
+use glow::{self, HasContext};
 pub struct Pass {
     program: glow::Program,
     vao: glow::VertexArray,

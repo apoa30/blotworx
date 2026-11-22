@@ -224,7 +224,7 @@ impl super::assets::World {
             slot.and_then(|slot| inventory.properties.iter().find(|p| p.name == "SketchCount")
                 .and_then(|p| p.value.get(slot)).and_then(|v| v.as_i64())).unwrap_or(0)
         } else { 0 };
-        Ok(mlua::MultiValue::from_vec(vec![mlua::Value::Integer(count)]))
+        Ok(mlua::MultiValue::from_vec(vec![mlua::Value::Integer(count as mlua::Integer)]))
     }
     /// REL26b760 ignores its supplied owner and queries the primary player.
     pub(super) fn ticket_count_lua(&mut self, args: mlua::MultiValue) -> mlua::Result<mlua::MultiValue> {
@@ -240,7 +240,7 @@ impl super::assets::World {
                 .ok_or_else(|| mlua::Error::external("Live ETicket property is missing"))?;
             super::inventory_commands::checked_fctiwz(value as f32).map_err(mlua::Error::external)?
         } else { 0 };
-        Ok(mlua::MultiValue::from_vec(vec![mlua::Value::Integer(i64::from(count))]))
+        Ok(mlua::MultiValue::from_vec(vec![mlua::Value::Integer(count as mlua::Integer)]))
     }
     ///216d8..2170c constructs one section from live owners, in native order.
     /// This captures the current reimplementation state; it does not claim

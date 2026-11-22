@@ -142,5 +142,5 @@ AccessControlInfo:
 SystemControlInfo:
   SaveDataSize: 0KB
   RemasterVersion: 0
-  StackSize: 0x40000
+  StackSize: 0x200000
   JumpId: 0x000400000B707800L

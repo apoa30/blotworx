@@ -783,6 +783,7 @@ impl Scripts {
         lua.globals().set(
             "Print",
             lua.create_function(|_, value: Value| {
+                #[cfg(not(target_os = "horizon"))]
                 eprintln!("[game Lua] {value:?}");
                 Ok(())
             })?,

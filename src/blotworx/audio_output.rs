@@ -3,9 +3,26 @@
 //! documented discrepancy from the original Wii mixer.
 use super::audio_playback::Clip;
 use anyhow::{ensure, Context, Result};
+#[cfg(not(target_os = "horizon"))]
+use std::sync::atomic::AtomicU64;
+#[cfg(target_os = "horizon")]
+#[derive(Default)]
+struct AtomicU64(Mutex<u64>);
+#[cfg(target_os = "horizon")]
+impl AtomicU64 {
+    fn new(v: u64) -> Self { Self(Mutex::new(v)) }
+    fn load(&self, _: Ordering) -> u64 { *self.0.lock().unwrap_or_else(|e| e.into_inner()) }
+    fn store(&self, v: u64, _: Ordering) { *self.0.lock().unwrap_or_else(|e| e.into_inner()) = v; }
+    fn fetch_add(&self, v: u64, _: Ordering) -> u64 {
+        let mut g = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let old = *g;
+        *g = old.wrapping_add(v);
+        old
+    }
+}
 use std::{
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, Ordering},
         mpsc, Arc, Condvar, Mutex,
     },
     thread,

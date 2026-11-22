@@ -20,7 +20,11 @@ fn trace_load_memory(stage: &str) {
         );
     }
 }
-#[cfg(not(feature = "blotworx-memory-profile"))]
+#[cfg(all(not(feature = "blotworx-memory-profile"), target_os = "horizon"))]
+fn trace_load_memory(stage: &str) {
+    super::horizon_3ds::debug_stage(stage);
+}
+#[cfg(all(not(feature = "blotworx-memory-profile"), not(target_os = "horizon")))]
 fn trace_load_memory(_: &str) {}
 
 #[path = "entity_initialize.rs"]
@@ -3379,7 +3383,7 @@ impl World {
                     if self.scripts.is_execution_detached() {
                         self.scripts.queue_native_callout(
                             "#bwx_animation_noise",
-                            mlua::MultiValue::from_vec(vec![mlua::Value::Integer(i64::try_from(
+                            mlua::MultiValue::from_vec(vec![mlua::Value::Integer(mlua::Integer::try_from(
                                 entity,
                             )?)]),
                         )?;
@@ -4099,7 +4103,7 @@ impl World {
                 }
                 let id = self.post_audio_from_game(entity, &event);
                 Ok(mlua::MultiValue::from_vec(vec![mlua::Value::Integer(
-                    id as i64,
+                    id as mlua::Integer,
                 )]))
             }
             "MultiPosSoundStart" | "MultiPosSoundStop" => {
@@ -5205,7 +5209,7 @@ impl World {
                         .globals
                         .get(&key)
                         .map_or(mlua::Value::Nil, |value| {
-                            mlua::Value::Integer(value as i64)
+                            mlua::Value::Integer(value as mlua::Integer)
                         })]));
                 }
                 let number = match &args[1] {
@@ -5249,7 +5253,7 @@ impl World {
                     }
                 }
                 Ok(mlua::MultiValue::from_vec(vec![mlua::Value::Integer(
-                    value as i64,
+                    value as mlua::Integer,
                 )]))
             }
             "ActivateScene" => {
@@ -5538,7 +5542,7 @@ impl World {
                     ));
                 }
                 Ok(mlua::MultiValue::from_vec(vec![mlua::Value::Integer(
-                    i64::from(self.playthrough.value),
+                    self.playthrough.value as mlua::Integer,
                 )]))
             }
             "SetPlaythrough" => {
@@ -8424,11 +8428,27 @@ fn key(s: &str) -> String {
         .trim_matches('/')
         .to_ascii_lowercase()
 }
+fn fast_key_eq(raw: &str, target: &str) -> bool {
+    let trimmed = raw.trim_matches(|c| c == '/' || c == '\\');
+    if trimmed.contains("..") || trimmed.contains("//") || trimmed.contains("\\\\") || trimmed.contains("/.") || trimmed.contains("\\.") {
+        return key(raw) == target;
+    }
+    let a = trimmed.as_bytes();
+    let b = target.as_bytes();
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b.iter()).all(|(&ca, &cb)| {
+        let na = if ca == b'\\' { b'/' } else { ca.to_ascii_lowercase() };
+        na == cb
+    })
+}
 fn lookup<'a>(files: &'a [VirtualFile], path: &str) -> Option<&'a VirtualFile> {
     let k = key(path);
+    let kw = format!("{k}_wii");
     files
         .iter()
-        .find(|f| key(&f.path) == k || key(&f.path) == format!("{k}_wii"))
+        .find(|f| fast_key_eq(&f.path, &k) || fast_key_eq(&f.path, &kw))
 }
 fn pack(root: &Path, name: &str, files: &mut Vec<VirtualFile>, report: &mut Report) -> Result<()> {
     let p = root.join("packfiles").join(name);
@@ -8614,6 +8634,27 @@ fn initial_scenes(shared: Option<&str>, part: &str) -> Result<Vec<String>> {
     Ok(scenes)
 }
 
+#[cfg(target_os = "horizon")]
+pub fn default_root() -> Option<PathBuf> {
+    for candidate in [
+        "sdmc:/blotworx/DATA/files",
+        "sdmc:/blotworx/DATA",
+        "sdmc:/blotworx/files",
+        "sdmc:/DATA/files",
+        "sdmc:/DATA",
+        "romfs:/DATA/files",
+        "romfs:/DATA",
+    ] {
+        let p = PathBuf::from(candidate);
+        let root = files_root(&p);
+        if root.join("packfiles").is_dir() {
+            return Some(root);
+        }
+    }
+    None
+}
+
+#[cfg(not(target_os = "horizon"))]
 pub fn default_root() -> Option<PathBuf> {
     let base = dirs::data_local_dir()?.join("BlueThinner/builds");
     let mut candidates: Vec<_> = std::fs::read_dir(base)

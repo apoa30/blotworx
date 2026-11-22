@@ -26,15 +26,30 @@ pub fn resolve_model<'a>(
         }
         parts.join("/")
     };
+    let matches_clean = |raw: &str, target: &str| -> bool {
+        let trimmed = raw.trim_matches(&['/', '\\', '"', ' '][..]);
+        if trimmed.contains("..") || trimmed.contains("//") || trimmed.contains("\\\\") || trimmed.contains("/.") || trimmed.contains("\\.") {
+            return clean(raw) == target;
+        }
+        let a = trimmed.as_bytes();
+        let b = target.as_bytes();
+        if a.len() != b.len() {
+            return false;
+        }
+        a.iter().zip(b.iter()).all(|(&ca, &cb)| {
+            let na = if ca == b'\\' { b'/' } else { ca.to_ascii_lowercase() };
+            na == cb
+        })
+    };
     let mut current = clean(path);
     let mut visited = std::collections::HashSet::new();
     for _ in 0..8 {
         if !visited.insert(current.clone()) {
             return None;
         }
+        let current_wii = format!("{current}_wii");
         let file = files.iter().find(|f| {
-            let p = clean(&f.path);
-            p == current || p == format!("{current}_wii")
+            matches_clean(&f.path, &current) || matches_clean(&f.path, &current_wii)
         })?;
         if !matches!(
             file.path.to_ascii_lowercase().rsplit('.').next(),
@@ -47,9 +62,9 @@ pub fn resolve_model<'a>(
         if model.is_empty() {
             return None;
         }
+        let model_wii = format!("{model}_wii");
         if files.iter().any(|f| {
-            let p = clean(&f.path);
-            p == model || p == format!("{model}_wii")
+            matches_clean(&f.path, &model) || matches_clean(&f.path, &model_wii)
         }) {
             current = model;
         } else {

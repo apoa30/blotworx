@@ -1,7 +1,8 @@
 param(
     [Parameter(Mandatory)][string] $DkpRoot,
     [Parameter(Mandatory)][string] $OutputDirectory,
-    [string] $RomfsLevelsDirectory
+    [string] $PrebuiltElf,
+    [switch] $Release
 )
 
 $ErrorActionPreference = 'Stop'
@@ -11,13 +12,14 @@ if (!$version) { throw 'Blotworx package version is missing.' }
 
 $dkp = (Resolve-Path -LiteralPath $DkpRoot).Path
 $gcc = Join-Path $dkp 'devkitARM/bin/arm-none-eabi-gcc.exe'
+$gxx = Join-Path $dkp 'devkitARM/bin/arm-none-eabi-g++.exe'
+$ar  = Join-Path $dkp 'devkitARM/bin/arm-none-eabi-ar.exe'
 $picasso = Join-Path $dkp 'tools/bin/picasso.exe'
 $smdhtool = Join-Path $dkp 'tools/bin/smdhtool.exe'
 $tool3dsx = Join-Path $dkp 'tools/bin/3dsxtool.exe'
 $makerom = Join-Path $dkp 'tools/bin/makerom.exe'
-$specs = Join-Path $dkp 'devkitARM/arm-none-eabi/lib/3dsx.specs'
 
-foreach ($bin in $gcc, $picasso, $smdhtool, $tool3dsx, $makerom, $specs) {
+foreach ($bin in $gcc, $gxx, $ar, $picasso, $smdhtool, $tool3dsx, $makerom) {
     if (!(Test-Path -LiteralPath $bin)) {
         throw "Required 3DS toolchain file is missing: $bin"
     }
@@ -25,25 +27,8 @@ foreach ($bin in $gcc, $picasso, $smdhtool, $tool3dsx, $makerom, $specs) {
 
 $output = (New-Item -ItemType Directory -Force -Path $OutputDirectory).FullName
 $work = (New-Item -ItemType Directory -Force -Path (Join-Path $output "3ds-build.work")).FullName
-$romfs = (New-Item -ItemType Directory -Force -Path (Join-Path $work "romfs/levels")).FullName
 
-if ($RomfsLevelsDirectory -and (Test-Path -LiteralPath $RomfsLevelsDirectory)) {
-    Get-ChildItem -LiteralPath $RomfsLevelsDirectory -Filter '*.bw3d' -File | ForEach-Object {
-        Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $romfs $_.Name) -Force
-    }
-}
-
-# 1. Assemble PICA200 vertex shader -> vshader_shbin.h
-$shbin = Join-Path $work 'vshader.shbin'
-& $picasso -o $shbin (Join-Path $PSScriptRoot 'vshader.pica')
-if ($LASTEXITCODE -ne 0) { throw 'picasso PICA200 shader assembly failed.' }
-
-$shBytes = [System.IO.File]::ReadAllBytes($shbin)
-$hex = ($shBytes | ForEach-Object { '0x{0:x2}' -f $_ }) -join ', '
-$headerText = "static const unsigned char vshader_shbin[] __attribute__((aligned(4))) = { $hex };`nstatic const unsigned int vshader_shbin_size = $($shBytes.Length);`n"
-[System.IO.File]::WriteAllText((Join-Path $work 'vshader_shbin.h'), $headerText)
-
-# 2. Generate 48x48 icon and SMDH metadata
+# 1. Generate 48x48 icon and SMDH metadata
 $iconPath = Join-Path $work 'icon.png'
 python -c "
 import zlib, struct, sys
@@ -69,27 +54,63 @@ open(sys.argv[1], 'wb').write(png)
 if ($LASTEXITCODE -ne 0) { throw 'Failed to generate 3DS icon.png.' }
 
 $smdhPath = Join-Path $work 'Blotworx.smdh'
-& $smdhtool --create "Blotworx $version" "Epic Mickey Runtime for Nintendo 3DS (Old3DS & New3DS)" "Bloticle" $iconPath $smdhPath
+& $smdhtool --create "Blotworx $version" "Native Rust Blotworx Engine for Nintendo 3DS" "Bloticle" $iconPath $smdhPath
 if ($LASTEXITCODE -ne 0) { throw 'smdhtool failed.' }
 
-# 3. Compile and link ARMv6K 3DS ELF
-$objPath = Join-Path $work 'main.o'
-$elfPath = Join-Path $work 'Blotworx.elf'
-& $gcc -g -Wall -O2 -mword-relocations -ffunction-sections -march=armv6k -mtune=mpcore -mfloat-abi=hard -mtp=soft `
-    -I"$work" -I"$PSScriptRoot" -I"$dkp/libctru/include" -D__3DS__ `
-    -c (Join-Path $PSScriptRoot 'main.c') -o $objPath
-if ($LASTEXITCODE -ne 0) { throw '3DS arm-none-eabi-gcc compilation failed.' }
+# 2. Build native Rust armv6k-nintendo-3ds Blotworx Engine ELF (unless -PrebuiltElf provided)
+if ($PrebuiltElf -and (Test-Path -LiteralPath $PrebuiltElf)) {
+    $elfPath = (Resolve-Path -LiteralPath $PrebuiltElf).Path
+} else {
+    $env:DEVKITPRO = $dkp
+    $env:DEVKITARM = Join-Path $dkp 'devkitARM'
+    $env:PATH = "$(Join-Path $dkp 'devkitARM/bin');$(Join-Path $dkp 'tools/bin');$env:PATH"
+    $env:CARGO_TARGET_ARMV6K_NINTENDO_3DS_LINKER = $gcc
+    $env:CC_armv6k_nintendo_3ds = $gcc
+    $env:CXX_armv6k_nintendo_3ds = $gxx
+    $env:AR_armv6k_nintendo_3ds = $ar
+    $env:CFLAGS_armv6k_nintendo_3ds = "-march=armv6k -mtune=mpcore -mfloat-abi=hard -mtp=soft"
+    $env:CXXFLAGS_armv6k_nintendo_3ds = "-march=armv6k -mtune=mpcore -mfloat-abi=hard -mtp=soft"
+    $env:LUA_INC = Join-Path $dkp 'portlibs/3ds/include/lua5.1'
+    $env:LUA_LIB = Join-Path $dkp 'portlibs/3ds/lib'
+    $env:LUA_LIB_NAME = "lua5.1"
+    $env:LUA_LINK = "static"
+    $libctru = (Join-Path $dkp 'libctru/lib') -replace '\\','/'
+    $portlibs = (Join-Path $dkp 'portlibs/3ds/lib') -replace '\\','/'
+    $sep = [char]0x1f
+    $rustFlagsList = @(
+        "-C", "panic=abort",
+        "-L", "native=$libctru",
+        "-L", "native=$portlibs",
+        "-C", "link-arg=-L$libctru",
+        "-C", "link-arg=-L$portlibs",
+        "-C", "link-arg=-lcitro3d",
+        "-C", "link-arg=-llua5.1",
+        "-C", "link-arg=-lctru",
+        "-C", "link-arg=-lstdc++"
+    )
+    # Note: do not pass -C strip=symbols here; 3dsx.specs uses --emit-relocs, which GNU ld
+    # rejects when combined with --strip-all. 3dsxtool and makerom strip symbols when packaging.
+    $env:CARGO_ENCODED_RUSTFLAGS = $rustFlagsList -join $sep
 
-& $gcc "-specs=$specs" -g -march=armv6k -mtune=mpcore -mfloat-abi=hard -mtp=soft `
-    $objPath "-L$dkp/libctru/lib" -lcitro3d -lctru -lm -o $elfPath
-if ($LASTEXITCODE -ne 0) { throw '3DS ELF linking failed.' }
+    Push-Location $root
+    try {
+        $cargoArgs = @('+nightly', 'build')
+        if ($Release) { $cargoArgs += '--release' }
+        $cargoArgs += @('--no-default-features', '--bin', 'blotworx', '-Z', 'build-std=std,panic_abort', '--target', 'armv6k-nintendo-3ds')
+        & cargo @cargoArgs
+        if ($LASTEXITCODE -ne 0) { throw 'Rust armv6k-nintendo-3ds build failed.' }
+    } finally {
+        Pop-Location
+    }
+    $profileDir = if ($Release) { 'release' } else { 'debug' }
+    $elfPath = Join-Path $root "target/armv6k-nintendo-3ds/$profileDir/blotworx.elf"
+}
 
-# 4. Package .3dsx and .cia
+# 3. Package .3dsx and .cia
 $out3dsx = Join-Path $output "Blotworx-$version-3DS.3dsx"
 $outCia  = Join-Path $output "Blotworx-$version-3DS.cia"
-$romfsRoot = Join-Path $work 'romfs'
 
-& $tool3dsx $elfPath $out3dsx "--smdh=$smdhPath" "--romfs=$romfsRoot"
+& $tool3dsx $elfPath $out3dsx "--smdh=$smdhPath"
 if ($LASTEXITCODE -ne 0) { throw '3dsxtool packaging failed.' }
 
 & $makerom -f cia -o $outCia -elf $elfPath -rsf (Join-Path $PSScriptRoot 'cia.rsf') -icon $smdhPath -exefslogo -ver 8

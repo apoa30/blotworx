@@ -1,7 +1,7 @@
 //! Original shader semantic locations bound to common viewport mesh buffers.
 //! Explicit mesh/model-space vectors are evaluated only when their pose changes.
 use anyhow::{ensure,Context,Result};
-use eframe::glow::{self,HasContext};
+use glow::{self,HasContext};
 use std::{collections::BTreeMap,sync::{Arc,Weak}};
 use crate::nif_vertex_attributes::Source;
 use super::d3d9_gpu::Program;

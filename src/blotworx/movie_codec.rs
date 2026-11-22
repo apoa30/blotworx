@@ -8,12 +8,17 @@ use std::{
 pub const ARCHIVE_URL:&str="https://files.pythonhosted.org/packages/2c/c6/fa760e12a2483469e2bf5058c5faff664acf66cadb4df2ad6205b016a73d/imageio_ffmpeg-0.6.0-py3-none-win_amd64.whl";
 pub const ARCHIVE_SHA: &str = "02fa47c83703c37df6bfe4896aab339013f62bf02c5ebf2dce6da56af04ffc0a";
 pub const EXE_SHA: &str = "2ce797a0f88d7f067180338fb227f7b1928ea727bd9a4d7a1d022f7c52af71a3";
+#[cfg(not(target_os = "horizon"))]
 pub fn digest(bytes: &[u8]) -> String {
     ring::digest::digest(&ring::digest::SHA256, bytes)
         .as_ref()
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect()
+}
+#[cfg(target_os = "horizon")]
+pub fn digest(_bytes: &[u8]) -> String {
+    String::new()
 }
 pub fn command(exe: &Path) -> Command {
     let mut c = Command::new(exe);
@@ -36,7 +41,12 @@ pub fn provision() -> Result<PathBuf> {
     Ok(path)
 }
 
-#[cfg(not(target_os = "android"))]
+#[cfg(target_os = "horizon")]
+pub fn provision() -> Result<PathBuf> {
+    anyhow::bail!("External movie codec binary is unsupported on Nintendo 3DS")
+}
+
+#[cfg(not(any(target_os = "android", target_os = "horizon")))]
 pub fn provision() -> Result<PathBuf> {
     static PROVISION: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _guard = PROVISION

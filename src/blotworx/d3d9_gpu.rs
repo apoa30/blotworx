@@ -2,7 +2,7 @@
 //! Owns linked interfaces; scene resources, pass states and vertex streams
 //! must still be supplied by the renderer before any draw is submitted.
 use anyhow::{ensure,Result};
-use eframe::glow::{self,HasContext};
+use glow::{self,HasContext};
 use std::sync::Arc;
 use super::{d3d9_shader::{PassConstants,TranslatedPass},d3d9_translate::{PackedUniforms,Translation}};
 #[derive(Debug)]

@@ -189,8 +189,7 @@ pub fn valid_path(path: &str) -> Result<()> {
     Ok(())
 }
 pub fn digest(data: &[u8]) -> String {
-    ring::digest::digest(&ring::digest::SHA256, data)
-        .as_ref()
+    crate::sha256(data)
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect()

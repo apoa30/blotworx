@@ -1,6 +1,6 @@
 //! Platform material submission at the shared viewport boundary.
 //! Geometry/camera ownership stays common; native material resources do not.
-use eframe::glow;
+use glow;
 use super::viewport3d::{GpuDrawCommand,GpuMeshHandle,GpuLight};
 use std::sync::{Arc,Mutex};
 

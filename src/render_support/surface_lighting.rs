@@ -4,7 +4,7 @@ use super::{
     material_preview::Program,
     viewport3d::{GpuDrawCommand, GpuLight},
 };
-use egui_glow::glow::{self, HasContext};
+use glow::{self, HasContext};
 use std::{
     collections::HashMap,
     sync::{Arc, Weak},

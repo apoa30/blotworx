@@ -374,7 +374,9 @@ impl Writer {
 pub fn default_directory() -> Result<PathBuf> {
     #[cfg(target_os = "android")]
     let storage = crate::android_app::storage();
-    #[cfg(not(target_os = "android"))]
+    #[cfg(target_os = "horizon")]
+    let storage = Some(PathBuf::from("sdmc:/blotworx"));
+    #[cfg(not(any(target_os = "android", target_os = "horizon")))]
     let storage = dirs::data_local_dir();
     Ok(storage
         .context("Local application storage is unavailable")?

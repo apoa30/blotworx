@@ -1,7 +1,7 @@
 //! Original D3D sampler state, independent of NIF texture flags and images.
 //! sRGB decode belongs to the image view; it is not a GLSL gamma approximation.
 use anyhow::{ensure,Context,Result};
-use eframe::glow::{self,HasContext};
+use glow::{self,HasContext};
 use super::d3d9_sampler::State;
 
 #[derive(Debug,Clone,PartialEq,Eq,PartialOrd,Ord)]

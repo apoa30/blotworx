@@ -298,9 +298,9 @@ fn component_id(
     // Deterministic IDs keep authored references stable as unrelated objects are
     // added to a level. Reserve neither sentinels nor signed-negative IDs.
     let key = serde_json::to_vec(&(owner, class, name, occurrence))?;
-    let bytes = ring::digest::digest(&ring::digest::SHA256, &key);
+    let bytes = crate::sha256(&key);
     let id =
-        0x1000_0000 | (u32::from_be_bytes(bytes.as_ref()[..4].try_into().unwrap()) & 0x0fff_ffff);
+        0x1000_0000 | (u32::from_be_bytes(bytes[..4].try_into().unwrap()) & 0x0fff_ffff);
     ensure!(
         !scene
             .objects

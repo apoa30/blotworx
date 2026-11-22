@@ -667,7 +667,7 @@ pub(crate) fn find_mesh_surface(nif: &NifFile, mesh: usize) -> PreviewSurface {
                             if flags == 0x5200 && path.rsplit(['\\', '/']).next().is_some_and(|name| {
                                 name.eq_ignore_ascii_case("AL_TreeHouse_RoofB1_Inert_tex.nif")
                             }) {
-                                sampler.wrap_u = eframe::glow::REPEAT;
+                                sampler.wrap_u = glow::REPEAT;
                             }
                             result.material.textures.push(MaterialTexture {
                                 shader_id: input.shader_id,
@@ -1104,42 +1104,48 @@ pub(crate) fn find_pak_texture<'a>(
     file_name: &str,
 ) -> Option<&'a VirtualFile> {
     let clean = file_name.replace('\\', "/");
-    let path1 = clean.trim_start_matches('/').to_string();
+    let path1 = clean.trim_start_matches('/');
     let path2 = format!("{path1}_wii");
+    let path_eq = |raw: &str, target: &str| -> bool {
+        let a = raw.as_bytes();
+        let b = target.as_bytes();
+        if a.len() != b.len() {
+            return false;
+        }
+        a.iter().zip(b.iter()).all(|(&ca, &cb)| {
+            let na = if ca == b'\\' { b'/' } else { ca };
+            na.eq_ignore_ascii_case(&cb)
+        })
+    };
 
     // 1. Full path match
     for vf in pak_files {
-        let vp = vf.path.replace('\\', "/");
-        if vp.eq_ignore_ascii_case(&path1) || vp.eq_ignore_ascii_case(&path2) {
+        if path_eq(&vf.path, path1) || path_eq(&vf.path, &path2) {
             return Some(vf);
         }
     }
 
     // 2. Basename / filename stem match
-    let target_name = std::path::Path::new(&path1)
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| path1.clone());
-    let target_stem = std::path::Path::new(&target_name)
-        .file_stem()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| target_name.clone());
+    let target_name = path1.rsplit('/').next().unwrap_or(path1);
+    let target_name_wii = format!("{target_name}_wii");
+    let target_stem = target_name
+        .rsplit_once('.')
+        .map(|(s, _)| s)
+        .unwrap_or(target_name);
+    let target_stem_wii = format!("{target_stem}_wii");
 
     for vf in pak_files {
-        let vf_path = vf.path.replace('\\', "/");
-        let vf_name = std::path::Path::new(&vf_path)
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_default();
-        let vf_stem = std::path::Path::new(&vf_name)
-            .file_stem()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_default();
+        let vf_name = vf
+            .path
+            .rsplit(|c| c == '/' || c == '\\')
+            .next()
+            .unwrap_or(&vf.path);
+        let vf_stem = vf_name.rsplit_once('.').map(|(s, _)| s).unwrap_or(vf_name);
 
-        if vf_name.eq_ignore_ascii_case(&target_name)
-            || vf_name.eq_ignore_ascii_case(&format!("{target_name}_wii"))
-            || vf_stem.eq_ignore_ascii_case(&target_stem)
-            || vf_stem.eq_ignore_ascii_case(&format!("{target_stem}_wii"))
+        if vf_name.eq_ignore_ascii_case(target_name)
+            || vf_name.eq_ignore_ascii_case(&target_name_wii)
+            || vf_stem.eq_ignore_ascii_case(target_stem)
+            || vf_stem.eq_ignore_ascii_case(&target_stem_wii)
         {
             return Some(vf);
         }
@@ -1340,6 +1346,28 @@ pub(crate) fn decode_wii_texture(
         // Fallback for bpp == 0 or others (like 4-bit)
         gx_decode_i4(data, width, height)
     };
+
+    #[cfg(target_os = "horizon")]
+    {
+        const MAX_3DS_DIM: u32 = 64;
+        if width > MAX_3DS_DIM || height > MAX_3DS_DIM {
+            let nw = width.min(MAX_3DS_DIM).max(1);
+            let nh = height.min(MAX_3DS_DIM).max(1);
+            let mut small = vec![0u8; (nw * nh * 4) as usize];
+            for dy in 0..nh {
+                let sy = ((dy as u64 * height as u64) / nh as u64).min(height as u64 - 1) as usize;
+                for dx in 0..nw {
+                    let sx = ((dx as u64 * width as u64) / nw as u64).min(width as u64 - 1) as usize;
+                    let src = (sy * width as usize + sx) * 4;
+                    let dst = (dy as usize * nw as usize + dx as usize) * 4;
+                    if src + 4 <= rgba.len() {
+                        small[dst..dst + 4].copy_from_slice(&rgba[src..src + 4]);
+                    }
+                }
+            }
+            return Some((small, nw, nh));
+        }
+    }
 
     Some((rgba, width, height))
 }

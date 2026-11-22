@@ -1253,7 +1253,7 @@ impl Runtime {
                 if owner.is_none_or(|owner|self.retired.contains(&owner)){return Ok(mlua::MultiValue::new());}
                 let name=name.split('\0').next().unwrap_or_default();
                 let playing=self.audio_posts.post(&self.audio,owner.unwrap(),name).map_err(mlua::Error::external)?;
-                Ok(mlua::MultiValue::from_vec(vec![Value::Integer(i64::from(playing))]))
+                Ok(mlua::MultiValue::from_vec(vec![Value::Integer(playing as mlua::Integer)]))
             }
             "AudioSetState"|"AudioSetSwitch"|"AudioStopPlaying"|"AudioStopPlayingOn"|"AudioStopPlayingAll"|"AudioSetParameter"=>{
                 // names (states, switches, parameters, events) use the same Wwise name hash as events
